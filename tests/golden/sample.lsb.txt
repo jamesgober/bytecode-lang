@@ -1,0 +1,67 @@
+lsb 1
+module s0 "demo"
+start f1
+strings 10
+  s0 "demo"
+  s1 "demo.mox"
+  s2 "hello"
+  s3 "Point"
+  s4 "x"
+  s5 "ls.io"
+  s6 "print"
+  s7 "counter"
+  s8 "sum"
+  s9 "main"
+types 4
+  t0 struct s3 { #0 s4: dyn }
+  t1 func (str) -> ()
+  t2 func (i64) -> (i64)
+  t3 func () -> ()
+consts 3
+  k0 str s2  ; "hello"
+  k1 int 1099511627776
+  k2 array [k1, k1]
+imports 1
+  imp0 s5 "ls.io" . s6 "print" : t1
+globals 1
+  g0 s7 "counter" : i64 mut = k1
+exports 1
+  s9 "main" = f1
+hooks 1
+  add = f0
+functions 2
+
+func f0 s8 "sum" : t2
+  regs r0:i64 r1:i64 r2:i64 r3:bool r4:i64
+  local r1 s4 "x" @2..@11
+  line @0 s1:1:1
+  line @2 s1:2:3
+  0000 load_int.i64 r1, 0
+  0001 load_int.i64 r2, 0
+L0:
+  0002 ilt.i64 r3, r2, r0
+  0003 jmp_if_not r3, L1
+  0004 iadd.i64 r1, r1, r2
+  0005 safepoint
+  0006 mov r4, r1
+  0007 mov r1, r2
+  0008 mov r2, r4
+  0009 iadd.i64.wrap r2, r2, r2
+  0010 jmp L0
+L1:
+  0011 ret r1
+
+func f1 s9 "main" : t3
+  regs r0:dyn r1:str r2:dyn r3:i64 r4:dyn
+  names n0=s4
+  type_refs ty0=t0
+  try @0..@6 -> L0 catch r4
+  0000 load_const r1, k0  ; "hello"
+  0001 call_import r0, imp0, 1  ; "ls.io"."print"
+  0002 get_global r3, g0  ; "counter"
+  0003 dload_const r2, k2  ; array[2]
+  0004 new_struct r2, ty0  ; t0
+  0005 get_prop r2, r2, n0  ; "x"
+  0006 ret_void
+L0:
+  0007 throw r4
