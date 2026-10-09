@@ -10,6 +10,7 @@
 
 use alloc::vec::Vec;
 
+use crate::call::{ArgKind, CallShape, ParamList};
 use crate::module::{Const, Function, Module};
 use crate::types::{TypeDef, ValType};
 use crate::{FORMAT_VERSION, MAGIC};
@@ -115,6 +116,40 @@ fn opt_u32(o: &mut impl Out, v: Option<u32>) {
     }
 }
 
+/// `opt<paramlist>`: 0, or 1 then the flags byte (bit 0 `ignore_extra`),
+/// the count, and per parameter its kind, its flags (bit 0 by reference,
+/// bit 1 default), and its optional name.
+fn param_list(o: &mut impl Out, list: Option<&ParamList>) {
+    let Some(list) = list else {
+        o.u8(0);
+        return;
+    };
+    o.u8(1);
+    o.u8(u8::from(list.ignore_extra));
+    o.len(list.params.len());
+    for p in &list.params {
+        o.u8(p.kind.code());
+        o.u8(u8::from(p.by_ref) | (u8::from(p.default) << 1));
+        opt_u32(o, p.name.map(|s| s.0));
+    }
+}
+
+/// A function's call shapes: the count, then per shape its argument count
+/// and per argument a tag (0 positional, 1 named + name `u32`, 2 spread,
+/// 3 named spread).
+fn shapes(o: &mut impl Out, shapes: &[CallShape]) {
+    o.len(shapes.len());
+    for shape in shapes {
+        o.len(shape.args.len());
+        for &arg in &shape.args {
+            o.u8(arg.tag());
+            if let ArgKind::Named(name) = arg {
+                o.u32(name.0);
+            }
+        }
+    }
+}
+
 fn strings(o: &mut impl Out, m: &Module) {
     o.len(m.strings.len());
     for s in m.strings.iter() {
@@ -194,6 +229,7 @@ fn imports(o: &mut impl Out, m: &Module) {
         o.u32(i.module.0);
         o.u32(i.name.0);
         o.u32(i.sig.0);
+        param_list(o, i.params.as_ref());
     }
 }
 
@@ -210,6 +246,7 @@ fn globals(o: &mut impl Out, m: &Module) {
 fn function(o: &mut impl Out, f: &Function) {
     o.u32(f.name.0);
     o.u32(f.sig.0);
+    param_list(o, f.params.as_ref());
     val_types(o, &f.regs);
     val_types(o, &f.captures);
     o.len(f.names.len());
@@ -228,6 +265,7 @@ fn function(o: &mut impl Out, f: &Function) {
             o.u32(t.0);
         }
     }
+    shapes(o, &f.shapes);
     o.len(f.handlers.len());
     for h in &f.handlers {
         o.u32(h.start);

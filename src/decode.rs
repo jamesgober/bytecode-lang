@@ -13,6 +13,7 @@
 use alloc::vec::Vec;
 use core::fmt;
 
+use crate::call::{ArgKind, CallShape, MAX_ARITY, Param, ParamKind, ParamList};
 use crate::encode::{SECTIONS, section};
 use crate::ids::{ConstId, FuncId, GlobalId, ImportId, Reg, StrId, Target, TypeId};
 use crate::inst::{Inst, InstError};
@@ -121,9 +122,12 @@ pub enum Limit {
     /// [`Limits::max_items`].
     Items,
     /// The format's cap of 65,536 entries on the tables a 16-bit operand
-    /// indexes: a function's registers, captures, name refs, and type refs,
-    /// and a struct's fields.
+    /// indexes: a function's registers, captures, name refs, type refs, and
+    /// call shapes, and a struct's fields.
     PerFunction,
+    /// The format's cap of 255 entries on a parameter list or a call shape
+    /// (call windows and argument counts are 8-bit).
+    Arity,
 }
 
 impl fmt::Display for Limit {
@@ -139,6 +143,7 @@ impl fmt::Display for Limit {
             Limit::TotalInsts => "total instructions",
             Limit::Items => "list length",
             Limit::PerFunction => "16-bit table size (65,536 entries)",
+            Limit::Arity => "arity (255 parameters or arguments)",
         })
     }
 }
@@ -260,7 +265,7 @@ impl fmt::Display for DecodeErrorKind {
 /// assert_eq!(err.offset(), 4);
 /// assert_eq!(
 ///     err.to_string(),
-///     "at byte 4: unsupported format version 9 (this decoder reads version 1)",
+///     "at byte 4: unsupported format version 9 (this decoder reads version 2)",
 /// );
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -609,14 +614,99 @@ impl Decoder<'_, '_> {
         Ok(consts)
     }
 
+    /// A byte that must be within `0..=max`, else an invalid tag.
+    fn small(&mut self, max: u8, what: &'static str) -> Result<u8> {
+        let at = self.r.pos;
+        let v = self.r.u8()?;
+        if v > max {
+            return self
+                .r
+                .fail(at, DecodeErrorKind::InvalidTag { what, tag: v });
+        }
+        Ok(v)
+    }
+
+    /// `opt<paramlist>` (see the encoder's `param_list`).
+    fn param_list(&mut self) -> Result<Option<ParamList>> {
+        if !self.r.bool("option")? {
+            return Ok(None);
+        }
+        let ignore_extra = self.small(1, "parameter list flags")? == 1;
+        // Kind, flags, and an absent name: three bytes at least.
+        let n = self.r.count(MAX_ARITY, Limit::Arity, 3)?;
+        let mut params = Vec::with_capacity(n);
+        for _ in 0..n {
+            let at = self.r.pos;
+            let code = self.r.u8()?;
+            let Some(kind) = ParamKind::from_code(code) else {
+                return self.r.fail(
+                    at,
+                    DecodeErrorKind::InvalidTag {
+                        what: "parameter kind",
+                        tag: code,
+                    },
+                );
+            };
+            let flags = self.small(3, "parameter flags")?;
+            let name = self.r.opt_u32()?.map(StrId);
+            params.push(Param {
+                name,
+                kind,
+                by_ref: flags & 1 != 0,
+                default: flags & 2 != 0,
+            });
+        }
+        Ok(Some(ParamList {
+            params,
+            ignore_extra,
+        }))
+    }
+
+    /// A function's call shapes (see the encoder's `shapes`).
+    fn shapes(&mut self) -> Result<Vec<CallShape>> {
+        let n = self.per_function(4)?;
+        let mut shapes = Vec::with_capacity(n);
+        for _ in 0..n {
+            let len = self.r.count(MAX_ARITY, Limit::Arity, 1)?;
+            let mut args = Vec::with_capacity(len);
+            for _ in 0..len {
+                let at = self.r.pos;
+                args.push(match self.r.u8()? {
+                    0 => ArgKind::Positional,
+                    1 => ArgKind::Named(StrId(self.r.u32()?)),
+                    2 => ArgKind::Spread,
+                    3 => ArgKind::SpreadNamed,
+                    tag => {
+                        return self.r.fail(
+                            at,
+                            DecodeErrorKind::InvalidTag {
+                                what: "call shape argument",
+                                tag,
+                            },
+                        );
+                    }
+                });
+            }
+            shapes.push(CallShape { args });
+        }
+        Ok(shapes)
+    }
+
     fn imports(&mut self) -> Result<Vec<Import>> {
-        let n = self.items(12)?;
+        // Three ids and an absent parameter list.
+        let n = self.items(13)?;
         let mut imports = Vec::with_capacity(n);
         for _ in 0..n {
             let module = StrId(self.r.u32()?);
             let name = StrId(self.r.u32()?);
             let sig = TypeId(self.r.u32()?);
-            imports.push(Import { module, name, sig });
+            let params = self.param_list()?;
+            imports.push(Import {
+                module,
+                name,
+                sig,
+                params,
+            });
         }
         Ok(imports)
     }
@@ -642,6 +732,7 @@ impl Decoder<'_, '_> {
     fn function(&mut self) -> Result<Function> {
         let name = StrId(self.r.u32()?);
         let sig = TypeId(self.r.u32()?);
+        let params = self.param_list()?;
         let regs = {
             let n = self.per_function(1)?;
             let mut v = Vec::with_capacity(n);
@@ -688,6 +779,7 @@ impl Decoder<'_, '_> {
             }
             v
         };
+        let shapes = self.shapes()?;
         let handlers = {
             let n = self.items(14)?;
             let mut v = Vec::with_capacity(n);
@@ -732,11 +824,13 @@ impl Decoder<'_, '_> {
         Ok(Function {
             name,
             sig,
+            params,
             regs,
             captures,
             names,
             type_refs,
             tables,
+            shapes,
             handlers,
             code,
             lines: Vec::new(),
@@ -745,10 +839,10 @@ impl Decoder<'_, '_> {
     }
 
     fn functions(&mut self) -> Result<Vec<Function>> {
-        // Name, signature, and seven list lengths.
+        // Name, signature, an absent parameter list, and eight list lengths.
         let n = self
             .r
-            .count(self.limits.max_functions, Limit::Functions, 36)?;
+            .count(self.limits.max_functions, Limit::Functions, 41)?;
         let mut functions = Vec::with_capacity(n);
         for _ in 0..n {
             functions.push(self.function()?);

@@ -39,17 +39,29 @@ fn kind(bytes: &[u8]) -> DecodeErrorKind {
     *decode(bytes).unwrap_err().kind()
 }
 
-/// A function payload: name 0, sig 0, the given register tags, no other
-/// tables, and the given code.
+/// A function payload: name 0, sig 0, no parameter list, the given register
+/// tags, no other tables, and the given code.
 fn function(regs: &[u8], code: &[[u8; 8]]) -> Vec<u8> {
+    function_with(&[0], regs, &[], code)
+}
+
+/// A function payload with an encoded parameter list and shape table.
+fn function_with(params: &[u8], regs: &[u8], shapes: &[u8], code: &[[u8; 8]]) -> Vec<u8> {
     let mut f = Vec::new();
     f.extend(u32le(0));
     f.extend(u32le(0));
+    f.extend(params);
     f.extend(u32le(regs.len() as u32));
     f.extend(regs);
-    for _ in 0..5 {
-        f.extend(u32le(0)); // captures, names, type refs, tables, handlers
+    for _ in 0..4 {
+        f.extend(u32le(0)); // captures, names, type refs, tables
     }
+    if shapes.is_empty() {
+        f.extend(u32le(0));
+    } else {
+        f.extend(shapes);
+    }
+    f.extend(u32le(0)); // handlers
     f.extend(u32le(code.len() as u32));
     for w in code {
         f.extend(w);
@@ -85,7 +97,7 @@ fn header_errors() {
     bad[0] = b'X';
     assert_eq!(kind(&bad), DecodeErrorKind::BadMagic);
 
-    for version in [0u32, 2, u32::MAX] {
+    for version in [0u32, 1, 3, u32::MAX] {
         let mut bad = good.clone();
         bad[4..8].copy_from_slice(&u32le(version));
         let err = decode(&bad).unwrap_err();
@@ -372,13 +384,82 @@ fn per_function_tables_are_capped_by_the_format() {
     let mut f = Vec::new();
     f.extend(u32le(0));
     f.extend(u32le(0));
+    f.push(0); // no parameter list
     f.extend(u32le(65_537));
-    f.resize(40, 0); // room for the smallest function encoding
+    f.resize(45, 0); // room for the smallest function encoding
     s[5] = [u32le(1).to_vec(), f].concat();
     assert_eq!(
         kind(&file(&s)),
         DecodeErrorKind::LimitExceeded(Limit::PerFunction)
     );
+}
+
+/// A module with one function whose payload is `f` (and its debug entry).
+fn one_function(f: Vec<u8>) -> Vec<u8> {
+    let mut s = empty();
+    s[5] = [u32le(1).to_vec(), f].concat();
+    s[9] = [u32le(1), u32le(0), u32le(0)].concat();
+    file(&s)
+}
+
+#[test]
+fn parameter_lists_and_shapes_decode_from_hand_assembled_bytes() {
+    use bytecode_lang::{ArgKind, Param, ParamKind, StrId};
+    // ignore_extra; `&$a` (normal, by reference, named s3) and `...$rest`
+    // (rest map, default flag clear, no name).
+    let params = [&[1u8, 1][..], &u32le(2), &[1, 1, 1], &u32le(3), &[4, 0, 0]].concat();
+    // One shape: (_, s5:, **).
+    let shapes = [&u32le(1)[..], &u32le(3), &[0, 1], &u32le(5), &[3]].concat();
+    let bytes = one_function(function_with(&params, &[13, 13], &shapes, &[]));
+    let module = decode(&bytes).unwrap();
+    let f = &module.functions()[0];
+    let list = f.params().unwrap();
+    assert!(list.ignore_extra);
+    assert_eq!(
+        list.params,
+        [
+            Param::normal(StrId(3)).by_ref(),
+            Param::new(ParamKind::RestMap, None)
+        ]
+    );
+    assert_eq!(
+        f.shapes()[0].args,
+        [
+            ArgKind::Positional,
+            ArgKind::Named(StrId(5)),
+            ArgKind::SpreadNamed
+        ]
+    );
+    assert_eq!(encode(&module), bytes);
+}
+
+#[test]
+fn parameter_list_and_shape_errors() {
+    let invalid =
+        |params: &[u8], shapes: &[u8]| kind(&one_function(function_with(params, &[], shapes, &[])));
+    let tag = |what, tag| DecodeErrorKind::InvalidTag { what, tag };
+    assert_eq!(invalid(&[2], &[]), tag("option", 2));
+    assert_eq!(invalid(&[1, 2], &[]), tag("parameter list flags", 2));
+    let kind6 = [&[1u8, 0][..], &u32le(1), &[6, 0, 0]].concat();
+    assert_eq!(invalid(&kind6, &[]), tag("parameter kind", 6));
+    let flags4 = [&[1u8, 0][..], &u32le(1), &[1, 4, 0]].concat();
+    assert_eq!(invalid(&flags4, &[]), tag("parameter flags", 4));
+    let too_many = [&[1u8, 0][..], &u32le(256), &[0; 768]].concat();
+    assert_eq!(
+        invalid(&too_many, &[]),
+        DecodeErrorKind::LimitExceeded(Limit::Arity)
+    );
+    let bad_arg = [&u32le(1)[..], &u32le(1), &[4]].concat();
+    assert_eq!(invalid(&[0], &bad_arg), tag("call shape argument", 4));
+    let long_shape = [&u32le(1)[..], &u32le(256), &[0; 256]].concat();
+    assert_eq!(
+        invalid(&[0], &long_shape),
+        DecodeErrorKind::LimitExceeded(Limit::Arity)
+    );
+    // An import's parameter list is read the same way.
+    let mut s = empty();
+    s[3] = [&u32le(1)[..], &u32le(0), &u32le(0), &u32le(0), &[1, 9]].concat();
+    assert_eq!(kind(&file(&s)), tag("parameter list flags", 9));
 }
 
 #[test]

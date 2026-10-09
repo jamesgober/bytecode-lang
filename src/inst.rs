@@ -26,11 +26,13 @@
 
 use core::fmt;
 
+use crate::call::ArgKind;
 use crate::ids::{
-    ConstId, FieldIdx, FuncId, GlobalId, ImportId, NameRef, Reg, TableId, Target, TypeRef, UpvalIdx,
+    ConstId, FieldIdx, FuncId, GlobalId, ImportId, NameRef, Reg, ShapeId, TableId, Target, TypeRef,
+    UpvalIdx,
 };
-use crate::module::{Const, Function, Module};
-use crate::policy::{FloatTy, IntConv, IntOp, IntPair, IntTy, Overflow, Policy};
+use crate::module::{Const, ErrorKind, Function, Module};
+use crate::policy::{FloatConv, FloatTy, IntConv, IntOp, IntPair, IntTy, Overflow, Policy};
 use crate::types::{Kind, Prim};
 
 /// Where an operand lives in the eight-byte instruction word.
@@ -140,6 +142,8 @@ pub enum FieldKind {
     Field,
     /// An [`UpvalIdx`].
     Upval,
+    /// A [`ShapeId`].
+    Shape,
     /// A 32-bit signed immediate.
     Imm32,
     /// An 8-bit count (arguments, string parts).
@@ -158,10 +162,15 @@ pub enum FieldKind {
     IntConv,
     /// An [`IntPair`] modifier.
     IntPair,
+    /// A [`FloatConv`] modifier.
+    FloatConv,
     /// A [`Kind`] modifier.
     Kind,
     /// A [`Prim`] modifier.
     Prim,
+    /// An [`ErrorKind`] modifier (its numeric code, one byte; catchable
+    /// kinds only).
+    ErrKind,
 }
 
 impl FieldKind {
@@ -185,8 +194,10 @@ impl FieldKind {
                 | FieldKind::IntOp
                 | FieldKind::IntConv
                 | FieldKind::IntPair
+                | FieldKind::FloatConv
                 | FieldKind::Kind
                 | FieldKind::Prim
+                | FieldKind::ErrKind
         )
     }
 
@@ -208,7 +219,8 @@ impl FieldKind {
             | FieldKind::Name
             | FieldKind::TypeRef
             | FieldKind::Field
-            | FieldKind::Upval => 16,
+            | FieldKind::Upval
+            | FieldKind::Shape => 16,
             FieldKind::Target
             | FieldKind::Const
             | FieldKind::Func
@@ -466,7 +478,7 @@ macro_rules! operand_bits {
 operand_u16!(UpvalIdx => Upval);
 operand_u32!(TableId => Table);
 operand_code!(IntTy => IntTy, FloatTy => FloatTy, Kind => Kind, Prim => Prim);
-operand_bits!(IntPair => IntPair);
+operand_bits!(IntPair => IntPair, FloatConv => FloatConv);
 
 impl Operand for Reg {
     const KIND: FieldKind = FieldKind::Reg;
@@ -691,6 +703,60 @@ impl Operand for TypeRef {
             Some(ty) => note.item(format_args!("{ty}")),
             None => note.item(format_args!("{self} <invalid>")),
         }
+    }
+}
+
+impl Operand for ShapeId {
+    const KIND: FieldKind = FieldKind::Shape;
+    fn to_raw(self) -> u32 {
+        u32::from(self.0)
+    }
+    fn from_raw(raw: u32) -> Option<Self> {
+        u16::try_from(raw).ok().map(ShapeId)
+    }
+    /// The shape, with names resolved: `(_, "x":, ...)`.
+    fn comment(self, cx: &Cx<'_>, note: &mut Note<'_>) -> fmt::Result {
+        let Some(func) = cx.func else { return Ok(()) };
+        let Some(shape) = func.shapes().get(self.index()) else {
+            return note.item(format_args!("{self} <invalid>"));
+        };
+        let mut text = alloc::string::String::from("(");
+        for (i, arg) in shape.args.iter().enumerate() {
+            if i > 0 {
+                text.push_str(", ");
+            }
+            match (arg, cx.module) {
+                (ArgKind::Named(name), Some(module)) => match module.string(*name) {
+                    Some(s) => {
+                        write_quoted(&mut text, s)?;
+                        text.push(':');
+                    }
+                    None => fmt::Write::write_fmt(&mut text, format_args!("{name} <invalid>:"))?,
+                },
+                (other, _) => fmt::Write::write_fmt(&mut text, format_args!("{other}"))?,
+            }
+        }
+        text.push(')');
+        note.item(format_args!("{text}"))
+    }
+}
+
+impl Operand for ErrorKind {
+    const KIND: FieldKind = FieldKind::ErrKind;
+    fn to_raw(self) -> u32 {
+        self.code()
+    }
+    /// Only catchable kinds: a trap is not an error value, so bytecode
+    /// cannot raise `OutOfFuel` or `Unreachable` as one.
+    fn from_raw(raw: u32) -> Option<Self> {
+        ErrorKind::from_code(raw).filter(|k| k.is_catchable())
+    }
+    /// `.E0200`: the code alone, since the kind's name has a space before it.
+    fn suffix(self, w: &mut dyn fmt::Write) -> fmt::Result {
+        write!(w, ".E{:04}", self.code())
+    }
+    fn comment(self, _cx: &Cx<'_>, note: &mut Note<'_>) -> fmt::Result {
+        note.item(format_args!("{}", self.name()))
     }
 }
 
@@ -1151,7 +1217,9 @@ isa! {
         dst: Reg @ B,
     }
 
-    /// `dst =` a callable reference to a host function.
+    /// `dst =` a callable reference to a host function: a first-class value
+    /// every dynamic call form accepts, bound by the import's parameter
+    /// list if it has one.
     0x08 LoadImport "load_import" {
         /// Destination `ref` (function type) or `dyn` register.
         dst: Reg @ B,
@@ -1364,8 +1432,8 @@ isa! {
         op: IntOp @ A,
     }
 
-    /// `dst = !src` (bitwise complement).
-    0x1F INot "inot" {
+    /// `dst = !src` (bitwise complement; HIR's `bit_not` on integers).
+    0x1F IBitNot "ibit_not" {
         /// Destination register.
         dst: Reg @ B,
         /// Operand.
@@ -1380,6 +1448,22 @@ isa! {
         dst: Reg @ B,
         /// Operand.
         src: Reg @ C,
+        /// Operand type and policy.
+        op: IntOp @ A,
+    }
+
+    /// `dst = lhs ** rhs` (OPS v2 `pow`): the exact power by repeated
+    /// squaring, `0 ** 0 = 1`; a result that does not fit per `overflow`
+    /// (`wrap` keeps the low bits); a negative exponent of a signed type
+    /// raises `NegativeExponent` (E0006) under every policy (`promote` is
+    /// never valid here). The exponent has the operand type.
+    0x27 IPow "ipow" {
+        /// Destination register.
+        dst: Reg @ B,
+        /// Base.
+        lhs: Reg @ C,
+        /// Exponent.
+        rhs: Reg @ D,
         /// Operand type and policy.
         op: IntOp @ A,
     }
@@ -1721,6 +1805,21 @@ isa! {
         ty: FloatTy @ A,
     }
 
+    /// `dst = pow(lhs, rhs)` (OPS v2 float `pow`): C99 Annex F special
+    /// cases, finite results by the family's shared `ls_pow` routine so every
+    /// tier is bit-identical; `f32` computes `ls_pow` on the operands widened
+    /// to `f64` and rounds once. Never an error.
+    0x48 FPow "fpow" {
+        /// Destination register.
+        dst: Reg @ B,
+        /// Base.
+        lhs: Reg @ C,
+        /// Exponent.
+        rhs: Reg @ D,
+        /// Operand type.
+        ty: FloatTy @ A,
+    }
+
     /// `dst = totalOrder(lhs, rhs)` as an `i8` of -1, 0, or 1 (IEEE 754
     /// total order: `-NaN < -inf < ... < -0 < +0 < ... < +inf < +NaN`).
     0x47 FTotalCmp "ftotal_cmp" {
@@ -1912,26 +2011,26 @@ isa! {
         ty: IntTy @ A,
     }
 
-    /// `dst = src` truncated toward zero to the integer type `op.ty()`;
-    /// NaN or out of range per `op.policy().float_to_int()`.
+    /// `dst = src` truncated toward zero to the integer type `conv.ty()`;
+    /// NaN or out of range per `conv.float_to_int()`.
     0x66 F32ToInt "f32_to_int" {
         /// Destination integer register.
         dst: Reg @ B,
         /// Source `f32` register.
         src: Reg @ C,
         /// Destination type and policy.
-        op: IntOp @ A,
+        conv: FloatConv @ A,
     }
 
-    /// `dst = src` truncated toward zero to the integer type `op.ty()`;
-    /// NaN or out of range per `op.policy().float_to_int()`.
+    /// `dst = src` truncated toward zero to the integer type `conv.ty()`;
+    /// NaN or out of range per `conv.float_to_int()`.
     0x67 F64ToInt "f64_to_int" {
         /// Destination integer register.
         dst: Reg @ B,
         /// Source `f64` register.
         src: Reg @ C,
         /// Destination type and policy.
-        op: IntOp @ A,
+        conv: FloatConv @ A,
     }
 
     /// `dst = src` widened to `f64` (exact).
@@ -2125,7 +2224,8 @@ isa! {
         pol: Policy @ A,
     }
 
-    /// Dynamic shift left (64-bit; amount rule per `shift`).
+    /// Dynamic shift left (64-bit; amount rule per `shift`, `saturate` for
+    /// PHP).
     0x7A DShl "dshl" {
         /// Destination register.
         dst: Reg @ B,
@@ -2159,8 +2259,9 @@ isa! {
         pol: Policy @ A,
     }
 
-    /// Dynamic bitwise complement (ints only, else hook).
-    0x7D DNot "dnot" {
+    /// Dynamic bitwise complement (PHP/Python `~`; HIR's `bit_not`): ints
+    /// only, else the `bit_not` hook.
+    0x7D DBitNot "dbit_not" {
         /// Destination register.
         dst: Reg @ B,
         /// Operand.
@@ -2316,6 +2417,7 @@ isa! {
 
     /// Dynamic indexing `dst = obj[key]`: arrays by int, maps by key, strings
     /// by int (the byte); misses and other kinds go to the `get_index` hook.
+    /// A reference slot reads as its reference's value.
     0x8C DGetIndex "dget_index" {
         /// Destination `dyn` register.
         dst: Reg @ B,
@@ -2325,7 +2427,8 @@ isa! {
         key: Reg @ D,
     }
 
-    /// Dynamic indexed store `obj[key] = src`.
+    /// Dynamic indexed store `obj[key] = src`; a reference slot is written
+    /// through, and a reference `src` stores its value.
     0x8D DSetIndex "dset_index" {
         /// The indexed value.
         obj: Reg @ B,
@@ -2366,9 +2469,11 @@ isa! {
         name: NameRef @ D,
     }
 
-    /// Dynamic call: `dst = callee(dst+1, ..., dst+argc)` with `dyn`
-    /// arguments, converted to the callee's parameter types; TypeError on an
-    /// arity or type mismatch; non-callables go to the `call` hook.
+    /// Dynamic call: `dst = callee(dst+1, ..., dst+argc)` with positional
+    /// `dyn` arguments, bound to the callee's parameter list (exactly
+    /// `dcall_shape` with an all-positional shape): ArgumentError (E0114)
+    /// when they do not bind, TypeError when one does not convert to its
+    /// parameter's type; non-callables go to the `call` hook.
     0x91 DCall "dcall" {
         /// Result register (`dyn`); arguments follow it.
         dst: Reg @ B,
@@ -2396,13 +2501,118 @@ isa! {
         src: Reg @ C,
     }
 
-    /// Dynamic logical not (PHP `!`, Python `not`): `dst = !truthy(src)` as a
-    /// `bool`, with exactly the truthiness rules of `dtruthy` (the `truthy`
-    /// hook included). `dnot` is the bitwise `~`.
-    0x94 DLNot "dlnot" {
+    /// Dynamic logical not (PHP `!`, Python `not`; HIR's `not`): `dst =
+    /// !truthy(src)` as a `bool`, with exactly the truthiness rules of
+    /// `dtruthy` (the `truthy` hook included). `dbit_not` is the bitwise `~`.
+    0x94 DNot "dnot" {
         /// Destination `bool` register.
         dst: Reg @ B,
         /// Operand.
+        src: Reg @ C,
+    }
+
+    /// Dynamic `**` (OPS v2 `pow`): two ints → integer `pow` at `i64` under
+    /// `pol` (`promote` gives the nearest `f64` of the exact power, and the
+    /// `f64` power for a negative exponent; other policies raise
+    /// `NegativeExponent` for one); numbers with a float → `fpow` in `f64`;
+    /// else the `pow` hook, else TypeError.
+    0x95 DPow "dpow" {
+        /// Destination register.
+        dst: Reg @ B,
+        /// Base.
+        lhs: Reg @ C,
+        /// Exponent.
+        rhs: Reg @ D,
+        /// Policy for the integer path.
+        pol: Policy @ A,
+    }
+
+    /// Dynamic absolute value: an int → `abs` at `i64` (`abs(MIN)` per
+    /// `overflow`; `promote` gives `9.223372036854775808e18`); a float →
+    /// `fabs`; else the `abs` hook, else TypeError.
+    0x96 DAbs "dabs" {
+        /// Destination register.
+        dst: Reg @ B,
+        /// Operand.
+        src: Reg @ C,
+        /// Policy for the integer path.
+        pol: Policy @ A,
+    }
+
+    /// Separate an element for a nested write (PHP `$a[k][] = v`): `obj`
+    /// (an array or map) is written, so its own copy-on-write store is made
+    /// unique first; then if `obj[key]` is an array or map that another
+    /// container may share, it is replaced by a copy (O(1), copy-on-write);
+    /// `dst` = the element, safe to write in place. A reference slot
+    /// separates the container inside the reference. An absent key gives
+    /// nil (nothing is stored); other kinds of `obj` behave exactly as
+    /// `dget_index`.
+    0x97 DSepIndex "dsep_index" {
+        /// Destination `dyn` register.
+        dst: Reg @ B,
+        /// The container.
+        obj: Reg @ C,
+        /// The key.
+        key: Reg @ D,
+    }
+
+    /// `dsep_index` for a property (PHP `$o->items[] = v`): a struct field
+    /// of type `dyn` or a map entry with that string key; an absent map
+    /// entry gives nil; other cases behave exactly as `get_prop`.
+    0x98 DSepProp "dsep_prop" {
+        /// Destination `dyn` register.
+        dst: Reg @ B,
+        /// The object.
+        obj: Reg @ C,
+        /// The property name.
+        name: NameRef @ D,
+    }
+
+    /// Dynamic call with a call shape: `dst = callee(...)` with the window
+    /// `dst+1 ..= dst+n` laid out by `shapes[shape]` (positional, named,
+    /// spread, named spread), bound to the callee's parameter list
+    /// (`ArgumentError` E0114 when they do not bind); non-callables go to
+    /// the `call_shape` hook, or to `call` when no argument is named.
+    0x99 DCallShape "dcall_shape" {
+        /// Result register (`dyn`); arguments follow it.
+        dst: Reg @ B,
+        /// The callee.
+        callee: Reg @ C,
+        /// The call shape.
+        shape: ShapeId @ D,
+    }
+
+    /// `dst` = whether a positional argument at position `pos` (an `i64`)
+    /// would be taken by reference by `callee`, so a code generator can
+    /// send a reference or a value (PHP decides per argument at run time).
+    /// False for non-callables, callees without a parameter list, and
+    /// negative positions. Never raises.
+    0x9A DParamRef "dparam_ref" {
+        /// Destination `bool` register.
+        dst: Reg @ B,
+        /// The callee.
+        callee: Reg @ C,
+        /// The 0-based position (`i64`).
+        pos: Reg @ D,
+    }
+
+    /// `dst` = whether a named argument `name` would be taken by reference
+    /// by `callee`. Never raises.
+    0x9B DParamRefNamed "dparam_ref_named" {
+        /// Destination `bool` register.
+        dst: Reg @ B,
+        /// The callee.
+        callee: Reg @ C,
+        /// The argument's name.
+        name: NameRef @ D,
+    }
+
+    /// `dst` = the payload of a runtime error value (what `raise` gave it;
+    /// nil for errors raised by instructions), or nil for any other value.
+    0x9C ErrPayload "err_payload" {
+        /// Destination `dyn` register.
+        dst: Reg @ B,
+        /// The caught value.
         src: Reg @ C,
     }
 
@@ -2528,6 +2738,16 @@ isa! {
     /// Abort the run with `Unreachable` (E0109).
     0xAE Unreachable "unreachable" {}
 
+    /// Raise the runtime error `kind` (any catchable kind) with `src` as its
+    /// payload, at this pc: how a code generator raises HIR's `NoMatch`
+    /// (E0200) with the scrutinee, or an `ArgumentError` from a prologue.
+    0xAF Raise "raise" {
+        /// The payload (`dyn`).
+        src: Reg @ B,
+        /// The error kind.
+        kind: ErrorKind @ A,
+    }
+
     // ---------------------------------------------------------------------
     // Closures and cells
     // ---------------------------------------------------------------------
@@ -2559,7 +2779,8 @@ isa! {
         ty: TypeRef @ D,
     }
 
-    /// `dst` = the value in `cell`.
+    /// `dst` = the value in `cell` (a `ref` to a cell type, or a `dyn`
+    /// holding a cell or a reference; TypeError otherwise).
     0xB3 CellGet "cell_get" {
         /// Destination register.
         dst: Reg @ B,
@@ -2567,12 +2788,95 @@ isa! {
         cell: Reg @ C,
     }
 
-    /// Store `src` into `cell`.
+    /// Store `src` into `cell` (operand rules as `cell_get`).
     0xB4 CellSet "cell_set" {
         /// The cell.
         cell: Reg @ B,
         /// The value.
         src: Reg @ C,
+    }
+
+    // ---------------------------------------------------------------------
+    // References (PHP `&`). A reference is a cell of `dyn` of kind
+    // `reference`; a container slot holding one is transparent: value reads
+    // and writes of the slot go through to the reference's value.
+    // ---------------------------------------------------------------------
+
+    /// `dst` = a new reference holding `src` (a variable taken by reference,
+    /// PHP `$r = &$x` when `$x` is not yet one). (A)
+    0xB5 NewRef "new_ref" {
+        /// Destination `dyn` or `ref cell dyn` register.
+        dst: Reg @ B,
+        /// The initial value (`dyn`).
+        src: Reg @ C,
+    }
+
+    /// `dst` = a reference to the slot `obj[key]` (PHP `&$a[k]`): the slot's
+    /// reference if it holds one; else the slot (created with nil if
+    /// absent in a map) is separated as by `dsep_index` and replaced by a
+    /// new reference holding its value. (A)
+    0xB6 DRefIndex "dref_index" {
+        /// Destination `dyn` or `ref cell dyn` register.
+        dst: Reg @ B,
+        /// The array or map.
+        obj: Reg @ C,
+        /// The key.
+        key: Reg @ D,
+    }
+
+    /// `dst` = a reference to the property `obj.name` (PHP `&$o->p`): a
+    /// struct field of type `dyn`, or a map entry with that string key
+    /// (created with nil if absent). (A)
+    0xB7 DRefProp "dref_prop" {
+        /// Destination `dyn` or `ref cell dyn` register.
+        dst: Reg @ B,
+        /// The object.
+        obj: Reg @ C,
+        /// The property name.
+        name: NameRef @ D,
+    }
+
+    /// Make the slot `obj[key]` the reference `src` (PHP `$a[k] = &$x`),
+    /// replacing what the slot held (a previous reference is unbound, not
+    /// written through). TypeError if `src` is not a reference. (A)
+    0xB8 DBindIndex "dbind_index" {
+        /// The array or map.
+        obj: Reg @ B,
+        /// The key.
+        key: Reg @ C,
+        /// The reference.
+        src: Reg @ D,
+    }
+
+    /// Make the property `obj.name` the reference `src` (PHP `$o->p =
+    /// &$x`). (A)
+    0xB9 DBindProp "dbind_prop" {
+        /// The object.
+        obj: Reg @ B,
+        /// The property name.
+        name: NameRef @ D,
+        /// The reference.
+        src: Reg @ C,
+    }
+
+    /// If the slot `obj[key]` holds a reference, replace it by the
+    /// reference's current value (a container value separated as by `dup`);
+    /// else nothing. Lets a code generator end a reference's hold on a slot
+    /// it can prove no other holder uses (PHP drops such references when it
+    /// copies the array).
+    0xBA DUnrefIndex "dunref_index" {
+        /// The array or map.
+        obj: Reg @ B,
+        /// The key.
+        key: Reg @ C,
+    }
+
+    /// `dunref_index` for a property.
+    0xBB DUnrefProp "dunref_prop" {
+        /// The object.
+        obj: Reg @ B,
+        /// The property name.
+        name: NameRef @ D,
     }
 
     // ---------------------------------------------------------------------
@@ -2767,8 +3071,10 @@ isa! {
 
     /// `dst` = a shallow copy of `src` (array, map, struct, or cell; a new
     /// identity, so value semantics such as PHP's array assignment are
-    /// explicit; implementations may copy lazily). Strings and callables
-    /// are returned as is.
+    /// explicit; O(1), the contents copied on the first write). Reference
+    /// slots stay shared between the copies. Strings and callables are
+    /// returned as is; iterators, coroutines, and references raise
+    /// TypeError.
     0xD4 Dup "dup" {
         /// Destination register.
         dst: Reg @ B,
@@ -2886,8 +3192,9 @@ isa! {
     }
 
     /// Suspend the running coroutine in state `yielded`, handing `src` to
-    /// its resumer under the next automatic key (PHP's rule: one more than
-    /// the largest integer key yielded so far, starting at 0); when resumed,
+    /// its resumer under the next automatic key (PHP's generator rule: one
+    /// more than the largest integer key yielded so far, never below 0, so
+    /// after only `yield -5 => x` it is 0); when resumed,
     /// `dst` = the value sent. The yield is an unwind point: `resume_throw`
     /// and `coro_close` raise here. CannotSuspend (E0111) outside a
     /// coroutine or across a host frame.
@@ -3097,6 +3404,19 @@ mod tests {
             argc: 2,
         };
         assert_eq!(c.to_string(), "call r3, f1, 2");
+    }
+
+    #[test]
+    fn error_kinds_print_their_code_and_name() {
+        let r = Inst::Raise {
+            src: Reg(3),
+            kind: ErrorKind::NoMatch,
+        };
+        assert_eq!(r.to_string(), "raise.E0200 r3  ; NoMatch");
+        assert_eq!(Inst::from_bytes(r.to_bytes()), Ok(r));
+        // Traps are not error values.
+        let trap = [0xAF, 107, 0, 0, 0, 0, 0, 0];
+        assert!(Inst::from_bytes(trap).is_err());
     }
 
     #[test]

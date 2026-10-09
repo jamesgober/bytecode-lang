@@ -1,5 +1,6 @@
 //! Criterion benchmarks: encoding, decoding, building, and disassembling
-//! modules of one million instructions.
+//! modules of one million instructions, and binding dynamic-call arguments
+//! (`ParamList::bind`) for 100,000 calls.
 //!
 //! ```text
 //! cargo bench --bench bench
@@ -8,8 +9,8 @@
 use std::hint::black_box;
 
 use bytecode_lang::{
-    Const, ConstId, FuncId, FunctionBuilder, Inst, IntOp, IntTy, Module, ModuleBuilder, Policy,
-    Reg, StrId, ValType, decode, disassemble, encode,
+    ArgItem, Const, ConstId, FuncId, FunctionBuilder, Inst, IntOp, IntTy, Module, ModuleBuilder,
+    Param, ParamKind, ParamList, Policy, Reg, StrId, ValType, decode, disassemble, encode,
 };
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 
@@ -161,5 +162,48 @@ fn codec(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, codec);
+/// Binding 100,000 dynamic calls to PHP's `function f($a, $b = 1, $c = 2,
+/// ...$rest)`, cycling through four call shapes: `f(1, 2)`, `f(1, c: 3)`,
+/// `f(1, 2, 3, 4, 5)` (two into the rest map), and `f(c: 3, a: 1, b: 2)`.
+fn binding(c: &mut Criterion) {
+    let mut m = ModuleBuilder::new();
+    let (a, b, cc) = (m.string("a"), m.string("b"), m.string("c"));
+    let module = m.finish().unwrap_or_else(|e| panic!("{e}"));
+    let list = ParamList::new(vec![
+        Param::normal(a),
+        Param::normal(b).with_default(),
+        Param::normal(cc).with_default(),
+        Param::new(ParamKind::RestMap, None),
+    ]);
+    let p = ArgItem::Positional;
+    let calls: [&[ArgItem<'_>]; 4] = [
+        &[p, p],
+        &[p, ArgItem::Named(b"c")],
+        &[p, p, p, p, p],
+        &[
+            ArgItem::Named(b"c"),
+            ArgItem::Named(b"a"),
+            ArgItem::Named(b"b"),
+        ],
+    ];
+    const CALLS: usize = 100_000;
+    let mut g = c.benchmark_group("bind");
+    g.sample_size(20);
+    g.throughput(Throughput::Elements(CALLS as u64));
+    g.bench_function("php_100k_calls", |bench| {
+        bench.iter(|| {
+            let mut present = 0u64;
+            for i in 0..CALLS {
+                let items = calls[i % calls.len()];
+                if let Ok(bound) = list.bind(black_box(&module), black_box(items)) {
+                    present ^= bound.presence();
+                }
+            }
+            black_box(present)
+        })
+    });
+    g.finish();
+}
+
+criterion_group!(benches, codec, binding);
 criterion_main!(benches);

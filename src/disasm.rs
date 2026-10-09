@@ -66,6 +66,9 @@ fn function(f: &mut fmt::Formatter<'_>, m: &Module, id: usize, func: &Function) 
     write!(f, "\nfunc f{id} ")?;
     named(f, m, func.name)?;
     writeln!(f, " : {}", func.sig)?;
+    if let Some(params) = &func.params {
+        writeln!(f, "  params {params}")?;
+    }
     types_list(f, "regs", "r", &func.regs)?;
     types_list(f, "captures", "u", &func.captures)?;
     if !func.names.is_empty() {
@@ -105,6 +108,9 @@ fn function(f: &mut fmt::Formatter<'_>, m: &Module, id: usize, func: &Function) 
         f.write_str("] default ")?;
         target(f, table.default.0)?;
         writeln!(f)?;
+    }
+    for (i, shape) in func.shapes.iter().enumerate() {
+        writeln!(f, "  shape cs{i} {shape}")?;
     }
     for h in &func.handlers {
         write!(f, "  try @{}..@{} -> ", h.start, h.end)?;
@@ -175,7 +181,11 @@ impl fmt::Display for Module {
             named(f, m, imp.module)?;
             f.write_str(" . ")?;
             named(f, m, imp.name)?;
-            writeln!(f, " : {}", imp.sig)?;
+            write!(f, " : {}", imp.sig)?;
+            if let Some(params) = &imp.params {
+                write!(f, " params {params}")?;
+            }
+            writeln!(f)?;
         }
         writeln!(f, "globals {}", m.globals.len())?;
         for (i, g) in m.globals.iter().enumerate() {

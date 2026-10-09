@@ -23,13 +23,16 @@
     <p>
         Instructions are eight bytes, encoded and decoded alike, so a function body is a flat array the interpreter walks without parsing. Registers are typed, with <code>dyn</code> as one of the types, so the same format carries an unboxed <code>i64</code> loop for a systems language and PHP-style arrays, properties, and loose comparisons for a dynamic one. Every integer instruction carries its overflow, division, and shift policy, so every execution tier computes the same result or raises the same error.
     </p>
+    <p>
+        Format version 2 carries PHP's semantics where a VM cannot fake them: nested array writes that copy only what may be shared, references into array slots and properties that survive copies the way PHP's do, and dynamic calls with named, spread, optional, variadic, and by-reference arguments bound by one rule every tier shares.
+    </p>
     <br>
     <hr>
     <p>
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, no dependencies.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0 (0.2.0, the foundation).</strong> The instruction set, module model, encoding, decoder, disassembler, and builder are complete. The verifier lands in 0.5.0; until then a decoded module is well-formed but not checked for meaning. See <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a> and <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>.
+        <strong>Status: pre-1.0 (0.3.0, LSB format version 2).</strong> The instruction set, module model, encoding, decoder, disassembler, builder, and the dynamic-call binding rule are complete. 0.3.0 is a breaking release: format 1 files are refused and several API items changed (see the CHANGELOG). The verifier lands in 0.5.0; until then a decoded module is well-formed but not checked for meaning. See <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a> and <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>.
     </blockquote>
 </div>
 
@@ -39,7 +42,8 @@
 ## The model
 
 - A **[`Module`](./docs/API.md#module)** is one compilation unit: a string table, a type table (function signatures, structs with single inheritance and methods, arrays, ordered maps, cells, iterators), a constant pool, imports (host functions), globals, functions, exports, dynamic-operation hooks, and per-function debug line tables and local names.
-- A **function** is a frame of typed 64-bit registers plus a flat array of **[`Inst`](./docs/API.md#inst)**ructions: 182 of them, covering moves and constants, OPS integer and float arithmetic with their policies (PHP's int-to-float `promote` included), conversions, dynamic arithmetic with a numeric fast path, dynamic truthiness and logical not, calls (direct, indirect, host, tail, dynamic), closures and cells, structs, arrays, insertion-ordered hash maps (PHP arrays), iteration, byte strings, type tests and casts, exceptions, GC safepoints, and stackful coroutines for generators and async tasks (`coro_new`, `yield`, `yield_kv`, `await`, `resume`, `resume_throw`, `coro_close`, `spawn`).
+- A **function** is a frame of typed 64-bit registers plus a flat array of **[`Inst`](./docs/API.md#inst)**ructions: 200 of them, covering moves and constants, OPS integer and float arithmetic with their policies (PHP's int-to-float `promote` and shift `saturate` included, `pow` in every form), conversions, dynamic arithmetic with a numeric fast path, dynamic truthiness and logical not, calls (direct, indirect, host, tail, dynamic, and shaped dynamic calls with named and spread arguments), closures and cells, structs, arrays, insertion-ordered hash maps (PHP arrays) with copy-on-write separation and references into their slots, iteration, byte strings, type tests and casts, exceptions (`raise` of any catchable kind with a payload), GC safepoints, and stackful coroutines for generators and async tasks (`coro_new`, `yield`, `yield_kv`, `await`, `resume`, `resume_throw`, `coro_close`, `spawn`).
+- A function or import may carry a **[`ParamList`](./docs/API.md#paramlist)** (names, rest parameters, defaults with a presence mask, by-reference parameters); **[`ParamList::bind`](./docs/API.md#paramlistbind)** is the one binding rule every tier applies to dynamic calls.
 - **[`encode`](./docs/API.md#encode)** and **[`decode`](./docs/API.md#decode)** convert between a module and its canonical bytes; **[`disassemble`](./docs/API.md#disassemble)** prints it.
 - **[`ModuleBuilder`](./docs/API.md#modulebuilder)** builds modules: branches take labels, strings and constants are deduplicated, and simultaneous register moves are sequentialized correctly.
 
@@ -59,6 +63,8 @@ What it guarantees, and how each guarantee is checked:
 | Parallel moves keep every value. | Random move sets, cycles included and naming the builder's own temporaries, are executed and compared with parallel assignment, and the number of moves is exactly one per move plus one per cycle. |
 | `overflow = promote` never lands in a statically typed register the builder can see. | Property test over every declared register type, for dynamic and typed instructions. |
 | Encoding and disassembly are deterministic. | Equal modules give equal bytes and identical listings, before and after a round trip. |
+| Dynamic calls bind by one rule. | `ParamList::bind` is checked against an independently written reference binder on random parameter lists and argument lists, errors included; named arguments bind the same in any order; the `dparam_ref` queries agree with the binding; 200,000 spread names bind in linear-logarithmic time. |
+| Every modifier byte means exactly one thing. | All 256 values of `Policy`, `IntOp`, and `FloatConv` are checked exhaustively (48, 192, and 16 valid); `raise` decodes exactly the catchable error kinds; every format 2 instruction round-trips as a word, through a module, and through the listing. |
 
 <hr>
 <br>
@@ -67,14 +73,14 @@ What it guarantees, and how each guarantee is checked:
 
 ```toml
 [dependencies]
-bytecode-lang = "0.2"
+bytecode-lang = "0.3"
 ```
 
 Without the standard library:
 
 ```toml
 [dependencies]
-bytecode-lang = { version = "0.2", default-features = false }
+bytecode-lang = { version = "0.3", default-features = false }
 ```
 
 <hr>
@@ -162,13 +168,45 @@ let module = m.finish().unwrap();
 assert_eq!(module.hook(Hook::Add), Some(Callee::Import(loose_add)));
 ```
 
+### PHP's calls, arrays, and references
+
+A dynamic call to a function with a real signature, a nested write that separates only a shared array, and a reference into a map slot:
+
+```rust
+use bytecode_lang::{ArgItem, Bound, Inst, ModuleBuilder, Param, ParamKind, ParamList, ValType};
+
+let d = ValType::Dyn;
+let mut m = ModuleBuilder::new();
+let (a, k) = (m.string("a"), m.string("k"));
+// function f(&$a, $k = 0, ...$rest): the signature ends with the presence mask.
+let list = ParamList::new(vec![
+    Param::normal(a).by_ref(),
+    Param::normal(k).with_default(),
+    Param::new(ParamKind::RestMap, None),
+]);
+let mut f = m.function("f", &[d, d, d, ValType::I64], &[]);
+f.set_params(list.clone());
+let (arr, inner, r) = (f.reg(d), f.reg(d), f.reg(d));
+f.emit(Inst::CellGet { dst: arr, cell: f.param(0) });          // $a is a reference
+f.emit(Inst::DSepIndex { dst: inner, obj: arr, key: f.param(1) }); // $a[$k][] = ...
+f.emit(Inst::DRefIndex { dst: r, obj: arr, key: f.param(1) });    // $r = &$a[$k]
+f.ret_void();
+m.add_function(f).unwrap();
+let module = m.finish().unwrap();
+
+// f($x, extra: 1): `$k` takes its default, `extra` lands in `$rest`.
+let bound = list.bind(&module, &[ArgItem::Positional, ArgItem::Named(b"extra")]).unwrap();
+assert_eq!(bound.slots(), &[Bound::Arg(0), Bound::Default, Bound::Collected(vec![1])]);
+assert_eq!(bound.presence(), 0b101);
+```
+
 ### Hostile input
 
 ```rust
 use bytecode_lang::{decode_with, DecodeErrorKind, Limit, Limits};
 
 // A header followed by a string section claiming four billion strings.
-let mut bytes = b"LSB\0\x01\0\0\0\0\0\0\0".to_vec();
+let mut bytes = b"LSB\0\x02\0\0\0\0\0\0\0".to_vec();
 bytes.extend([1, 0, 0, 0, 4, 0, 0, 0, 0xff, 0xff, 0xff, 0xff]);
 let mut limits = Limits::default();
 limits.max_strings = 1000;
@@ -188,6 +226,7 @@ Runnable programs in [`examples/`](./examples):
 |---|---|
 | [`quickstart`](./examples/quickstart.rs) | An iterative Fibonacci built with labels and a parallel move, encoded, decoded, and disassembled. `cargo run --example quickstart` |
 | [`inspect`](./examples/inspect.rs) | Decoding a file under explicit limits and reporting where a corrupt one goes wrong. `cargo run --example inspect -- module.lsb` |
+| [`php`](./examples/php.rs) | PHP semantics in format 2: a by-reference, defaulted, variadic signature; a run-time by-reference decision; a shaped call with a spread and a named argument; separation; a reference into a map slot; `raise` of `NoMatch`; and how one call binds. `cargo run --example php` |
 
 <hr>
 <br>
@@ -205,8 +244,11 @@ Measured with the benchmarks in [`benches/`](./benches) on a module of 1,000 fun
 | `inst/from_bytes_1m` | Decode one million words alone, output preallocated. | ~2.2 ms · ~457 M inst/s |
 | `1m_insts/build` | Build the module with the builder, labels resolved, branch targets and `promote` checked. | ~3.8–4.5 ms · ~220–260 M inst/s |
 | `100k_insts/disassemble` | Disassemble 100,000 instructions to text. | ~12.3 ms · ~8.1 M inst/s |
+| `bind/php_100k_calls` | Bind 100,000 dynamic calls to `f($a, $b = 1, $c = 2, ...$rest)` with `ParamList::bind`, four call shapes in turn (positional, named, extras into the rest map, all named). | ~6.7–7.3 ms · ~67–73 ns per call |
 
 Decoding costs about twice `from_bytes` alone: the difference is allocating and first touching the 8 MB of decoded code. Ranges are across runs on a machine shared with other builds. The builder's `overflow = promote` check, fused into its branch-target pass, costs about 0.1–0.5 ms per million instructions (≈3–12%) in interleaved measurements. These are library-only numbers; nothing here measures a VM.
+
+0.3.0 against 0.2.0, both built and run back to back on the same (loaded) machine: encoding and building are unchanged within the run-to-run spread; decoding measured faster in 0.3.0 (≈2.3–2.8 ms against ≈4.2–4.4 ms for the million-instruction module, a difference not isolated, so not claimed as a gain); disassembly measured ≈7% slower (≈10.6–10.9 ms against ≈9.9–10.2 ms per 100,000 instructions), not isolated either. The binder allocates its result (one slot per parameter, one list per rest parameter); a VM that binds on a hot path uses its own fast path for all-positional exact calls and checks the rest against `ParamList::bind`.
 
 ```bash
 cargo bench --bench bench
@@ -238,7 +280,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo bench --bench bench
 ```
 
-The property tests in [`tests/properties.rs`](./tests/properties.rs) generate instructions from the crate's own opcode metadata (so every opcode and modifier is covered without a hand-kept list), build arbitrary modules, and check the round trip, canonicity, determinism, decoder robustness against arbitrary, framed, and mutated bytes, budgets, label resolution against a reference resolver, and parallel moves against parallel assignment. [`tests/codec.rs`](./tests/codec.rs) hand-assembles inputs for every decode error, independently of the encoder. [`tests/disasm.rs`](./tests/disasm.rs) pins the listing format with a golden file. Every `rust` example in this README and in [`docs/API.md`](./docs/API.md) is compiled and run as a doctest.
+The property tests in [`tests/properties.rs`](./tests/properties.rs) generate instructions from the crate's own opcode metadata (so every opcode and modifier is covered without a hand-kept list), build arbitrary modules (parameter lists and call shapes included), and check the round trip, canonicity, determinism, decoder robustness against arbitrary, framed, and mutated bytes, budgets, label resolution against a reference resolver, and parallel moves against parallel assignment. [`tests/codec.rs`](./tests/codec.rs) hand-assembles inputs for every decode error, independently of the encoder. [`tests/disasm.rs`](./tests/disasm.rs) pins the listing format with a golden file. [`tests/binding.rs`](./tests/binding.rs) checks the dynamic-call binding rule against an independent reference, and [`tests/format2.rs`](./tests/format2.rs) every instruction, rename, and modifier change of format version 2. Every `rust` example in this README and in [`docs/API.md`](./docs/API.md) is compiled and run as a doctest.
 
 <hr>
 <br>

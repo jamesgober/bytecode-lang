@@ -16,8 +16,8 @@ fn decoded_instructions_are_eight_bytes() {
 }
 
 #[test]
-fn the_table_has_182_opcodes_with_unique_bytes_and_names() {
-    assert_eq!(Opcode::ALL.len(), 182);
+fn the_table_has_200_opcodes_with_unique_bytes_and_names() {
+    assert_eq!(Opcode::ALL.len(), 200);
     let bytes: BTreeSet<u8> = Opcode::ALL.iter().map(|&op| op as u8).collect();
     let names: BTreeSet<&str> = Opcode::ALL.iter().map(|op| op.mnemonic()).collect();
     assert_eq!(bytes.len(), Opcode::ALL.len());
@@ -70,7 +70,8 @@ fn max_raw(kind: FieldKind) -> u32 {
         | FieldKind::Name
         | FieldKind::TypeRef
         | FieldKind::Field
-        | FieldKind::Upval => 0xffff,
+        | FieldKind::Upval
+        | FieldKind::Shape => 0xffff,
         FieldKind::Target
         | FieldKind::Const
         | FieldKind::Func
@@ -82,14 +83,25 @@ fn max_raw(kind: FieldKind) -> u32 {
         FieldKind::Bool => 1,
         FieldKind::IntTy => 7,
         FieldKind::FloatTy => 1,
-        FieldKind::Kind => 13,
+        FieldKind::Kind => 14,
         FieldKind::Prim => 13,
-        // overflow = promote (3) and every flag set.
-        FieldKind::Policy => 0b1_1111,
-        FieldKind::IntOp => 0xff,
+        // overflow = promote (3), div_zero = trap, shift = saturate (2),
+        // float_to_int = saturate.
+        FieldKind::Policy => 0b11_0111,
+        // u64 (7), promote, divtrap, shift = saturate.
+        FieldKind::IntOp => 0b1011_1111,
         FieldKind::IntConv => 0xff,
         FieldKind::IntPair => 0b0011_1111,
+        FieldKind::FloatConv => 0b1111,
+        // NoMatch, the largest code.
+        FieldKind::ErrKind => 200,
     }
+}
+
+/// The smallest valid raw value for a field: zero, except for an error
+/// kind, whose smallest code is 1 (`ArithOverflow`).
+fn min_raw(kind: FieldKind) -> u32 {
+    u32::from(kind == FieldKind::ErrKind)
 }
 
 #[test]
@@ -97,7 +109,7 @@ fn every_opcode_round_trips_at_zero_and_at_maximum() {
     for &op in Opcode::ALL {
         let fields = op.fields();
         for raws in [
-            vec![0; fields.len()],
+            fields.iter().map(|f| min_raw(f.kind)).collect::<Vec<u32>>(),
             fields.iter().map(|f| max_raw(f.kind)).collect(),
         ] {
             let bytes = common::assemble(op, &raws);
@@ -140,15 +152,9 @@ fn invalid_modifier_values_are_refused() {
     let mut checked = 0;
     for &op in Opcode::ALL {
         for (i, f) in op.fields().iter().enumerate() {
-            // Counts, `IntOp`, and `IntConv` have no invalid byte: every
-            // value names a count, or a type plus a policy (all four
-            // overflow codes are defined since `promote`).
-            if f.slot != Slot::A
-                || matches!(
-                    f.kind,
-                    FieldKind::Count | FieldKind::IntOp | FieldKind::IntConv
-                )
-            {
+            // Counts and `IntConv` have no invalid byte: every value names
+            // a count, or two types and an overflow policy.
+            if f.slot != Slot::A || matches!(f.kind, FieldKind::Count | FieldKind::IntConv) {
                 continue;
             }
             // 0xff is invalid for every byte-sized kind except counts.
@@ -164,9 +170,10 @@ fn invalid_modifier_values_are_refused() {
             checked += 1;
         }
     }
-    // 59 opcodes carry a modifier byte that has invalid values (an integer
-    // or float type, a `Policy`, an `IntPair`, a kind, a prim, or a flag).
-    assert_eq!(checked, 59);
+    // 83 opcodes carry a modifier byte that has invalid values: an integer
+    // or float type, a `Policy`, an `IntOp` (shift code 3), a `FloatConv`, an
+    // `IntPair`, a kind, a prim, an error kind, or a flag.
+    assert_eq!(checked, 83);
 }
 
 #[test]

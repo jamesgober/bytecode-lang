@@ -4,8 +4,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use bytecode_lang::{
-    Callee, Const, ExportItem, Field, Hook, Inst, IntOp, IntTy, Module, ModuleBuilder, Overflow,
-    Policy, Reg, StructDef, Target, TypeDef, ValType, decode, disassemble, encode,
+    ArgKind, Callee, Const, ErrorKind, ExportItem, Field, Hook, Inst, IntOp, IntTy, Module,
+    ModuleBuilder, Overflow, Param, ParamKind, ParamList, Policy, Reg, StructDef, Target, TypeDef,
+    ValType, decode, disassemble, encode,
 };
 
 /// A small Mox-flavoured module touching every section.
@@ -125,7 +126,74 @@ fn sample() -> Module {
     f.try_region(start, end, catch, err);
     let main = m.add_function(f).unwrap();
 
+    // PHP: function push(&$a, $k, $v = null) { $a[$k][] ...; printf(...) }
+    let (a, k, v, format) = (
+        m.string("a"),
+        m.string("k"),
+        m.string("v"),
+        m.string("format"),
+    );
+    let printf_sig = m.func_type(&[ValType::Dyn, ValType::Dyn], &[ValType::Dyn]);
+    let printf = m.import_with_params(
+        "php.std",
+        "printf",
+        printf_sig,
+        ParamList::new(vec![
+            Param::normal(format),
+            Param::new(ParamKind::RestMap, None),
+        ]),
+    );
+    let d = ValType::Dyn;
+    let mut f = m.function("push", &[d, d, d, ValType::I64], &[]);
+    f.set_params(
+        ParamList::new(vec![
+            Param::normal(a).by_ref(),
+            Param::normal(k),
+            Param::normal(v).with_default(),
+        ])
+        .ignoring_extra(),
+    );
+    let (arr, slot, r, p, byref) = (f.reg(d), f.reg(d), f.reg(d), f.reg(d), f.reg(ValType::Bool));
+    let window = f.regs(&[d, d, d]);
+    let pol = Policy::new().with_overflow(Overflow::Promote);
+    f.emit(Inst::CellGet {
+        dst: arr,
+        cell: f.param(0),
+    });
+    f.emit(Inst::DSepIndex {
+        dst: slot,
+        obj: arr,
+        key: f.param(1),
+    });
+    f.emit(Inst::DRefIndex {
+        dst: r,
+        obj: slot,
+        key: f.param(2),
+    });
+    f.emit(Inst::DPow {
+        dst: p,
+        lhs: f.param(1),
+        rhs: f.param(1),
+        pol,
+    });
+    f.emit(Inst::LoadImport {
+        dst: window,
+        import: printf,
+    });
+    f.emit(Inst::DParamRef {
+        dst: byref,
+        callee: window,
+        pos: f.param(3),
+    });
+    f.dcall_shape(window, window, &[ArgKind::Positional, ArgKind::Named(k)]);
+    f.emit(Inst::Raise {
+        src: f.param(1),
+        kind: ErrorKind::NoMatch,
+    });
+    let push = m.add_function(f).unwrap();
+
     m.export("main", ExportItem::Func(main));
+    m.export("push", ExportItem::Func(push));
     m.hook(Hook::Add, Callee::Func(sum));
     m.set_start(main);
     m.finish().unwrap()

@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc cec5e630e7ea8f5f7d0917b3dda20bf4204359a6b1217ca08b146ed8afc12bd5 # shrinks to spec = ([(1, false, false)], false), items = [Pos, Name("p0")]
+cc 0542a9def5c9a8c5b5df10ac7ae170b0fa1367f8037e45b3f0d11b4998e51016 # shrinks to spec = ([(2, false, false), (4, false, false), (0, false, true)], false), items = [Name("p2"), Name("p2")]
+cc 3b5f56fd026f1f19a82d3919efdb7e073d6a1a4c400e4bcb1a2bfea91a9d8327 # shrinks to spec = ([(0, false, false), (0, false, false)], false), items = [Name("p0")]

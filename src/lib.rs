@@ -43,13 +43,24 @@
 //!   a function body is a flat `&[Inst]` that an interpreter walks without
 //!   re-parsing. Branch targets are resolved instruction indices.
 //! - **Policies on every operation.** Integer instructions carry an
-//!   [`IntOp`]: the operand type plus the complete OPS policy set (overflow,
-//!   division by zero, shift range, float-to-int), so every tier computes the
-//!   same result or raises the same [`ErrorKind`].
+//!   [`IntOp`] (the operand type plus the overflow, division-by-zero, and
+//!   shift policies), dynamic ones a [`Policy`], float-to-integer
+//!   conversions a [`FloatConv`], so every tier computes the same result or
+//!   raises the same [`ErrorKind`].
 //! - **Dynamic languages built in.** `dyn` arithmetic and comparisons with a
 //!   numeric fast path, ordered hash maps, property access, iteration, and
 //!   per-module [`Hook`]s that let a language supply its own semantics for
-//!   the slow path. `overflow = promote` gives PHP's int-to-float arithmetic.
+//!   the slow path. `overflow = promote` gives PHP's int-to-float arithmetic,
+//!   `shift = saturate` its shifts.
+//! - **PHP's value and reference semantics.** `dsep_index` separates a nested
+//!   array only when it may be shared; references into map slots and
+//!   properties (`dref_index`, `dbind_index`) are transparent in their
+//!   slots and survive copies as PHP's do.
+//! - **Dynamic calls with real signatures.** A function or import may carry a
+//!   [`ParamList`] (names, rest parameters, defaults, by-reference
+//!   parameters); `dcall_shape` passes named and spread arguments through a
+//!   [`CallShape`], and [`ParamList::bind`] is the one binding rule every
+//!   tier applies.
 //! - **Coroutines.** Stackful coroutines (`coro_new`, `yield`, `await`,
 //!   `resume`, `spawn`) for generators, fibers, and async tasks; see
 //!   [`CoroState`].
@@ -93,6 +104,7 @@ extern crate alloc;
 mod macros;
 
 mod builder;
+mod call;
 mod decode;
 mod disasm;
 mod encode;
@@ -106,10 +118,14 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 pub use builder::{BuildError, FunctionBuilder, Label, ModuleBuilder};
+pub use call::{
+    ArgItem, ArgKind, BindError, Binding, Bound, CallShape, Param, ParamError, ParamKind,
+    ParamList, ShapeError,
+};
 pub use decode::{DecodeError, DecodeErrorKind, Limit, Limits};
 pub use ids::{
-    ConstId, FieldIdx, FuncId, GlobalId, ImportId, NameRef, Reg, StrId, TableId, Target, TypeId,
-    TypeRef, UpvalIdx,
+    ConstId, FieldIdx, FuncId, GlobalId, ImportId, NameRef, Reg, ShapeId, StrId, TableId, Target,
+    TypeId, TypeRef, UpvalIdx,
 };
 pub use inst::{FieldKind, FieldSpec, Inst, InstError, Opcode, Slot};
 pub use module::{
@@ -117,7 +133,8 @@ pub use module::{
     Import, JumpTable, LineRow, LocalVar, Module,
 };
 pub use policy::{
-    DivZero, FloatToInt, FloatTy, IntConv, IntOp, IntPair, IntTy, Overflow, Policy, Shift,
+    DivZero, FloatConv, FloatToInt, FloatTy, IntConv, IntOp, IntPair, IntTy, Overflow, Policy,
+    Shift,
 };
 pub use types::{CoroState, Field, FuncType, Kind, Method, Prim, StructDef, TypeDef, ValType};
 
@@ -137,6 +154,10 @@ pub const MAGIC: [u8; 4] = *b"LSB\0";
 ///
 /// The version changes whenever the encoding or any instruction's meaning
 /// changes; [`decode`] refuses every other version rather than guess.
+/// Version 2 (bytecode-lang 0.3) added parameter lists and call shapes to
+/// the function and import records, repacked the policy bytes for
+/// `shift = saturate`, and added the reference, separation, `pow`, `abs`,
+/// shaped-call, and `raise` instructions (`specs/LSB.md` §7.4).
 ///
 /// # Examples
 ///
@@ -145,8 +166,9 @@ pub const MAGIC: [u8; 4] = *b"LSB\0";
 ///
 /// let bytes = encode(&ModuleBuilder::new().finish().unwrap());
 /// assert_eq!(bytes[4..8], FORMAT_VERSION.to_le_bytes());
+/// assert_eq!(FORMAT_VERSION, 2);
 /// ```
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Encodes a module into its canonical bytes.
 ///
@@ -245,7 +267,7 @@ pub struct MarkdownDocTests;
 /// f.ret_void();
 /// m.add_function(f).unwrap();
 /// let text = disassemble(&m.finish().unwrap());
-/// assert!(text.starts_with("lsb 1\n"));
+/// assert!(text.starts_with("lsb 2\n"));
 /// assert!(text.contains("func f0 s0 \"main\" : t0"));
 /// assert!(text.contains("  0000 ret_void"));
 /// ```

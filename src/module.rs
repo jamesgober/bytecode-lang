@@ -4,6 +4,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
+use crate::call::{CallShape, ParamList};
 use crate::ids::{ConstId, FuncId, GlobalId, ImportId, Reg, StrId, Target, TypeId};
 use crate::inst::Inst;
 use crate::types::{TypeDef, ValType};
@@ -175,15 +176,21 @@ impl fmt::Display for Const {
 /// ([`Inst::CallImport`](crate::Inst::CallImport)), bound by the loader by
 /// `module` and `name`.
 ///
+/// An import is also a first-class value: [`Inst::LoadImport`](crate::Inst::LoadImport)
+/// makes a function value of it that every dynamic call form accepts. With a
+/// [`ParamList`], dynamic calls of it take named, spread, extra, and missing
+/// arguments as for a bytecode function (`specs/LSB.md` §5.15); the host
+/// receives the bound parameters in signature order, presence mask included.
+///
 /// # Examples
 ///
 /// ```
 /// use bytecode_lang::{Import, StrId, TypeId};
 ///
-/// let print = Import { module: StrId(0), name: StrId(1), sig: TypeId(2) };
+/// let print = Import { module: StrId(0), name: StrId(1), sig: TypeId(2), params: None };
 /// assert_eq!(print.sig, TypeId(2));
 /// ```
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Import {
     /// The providing module's name (for example `ls.io`).
     pub module: StrId,
@@ -191,6 +198,10 @@ pub struct Import {
     pub name: StrId,
     /// The function's signature (a [`TypeDef::Func`] entry).
     pub sig: TypeId,
+    /// The dynamic-call signature, if the host function takes named,
+    /// variadic, optional, or by-reference arguments; `None` means exact
+    /// positional arity.
+    pub params: Option<ParamList>,
 }
 
 /// A module-level variable.
@@ -358,6 +369,15 @@ code_enum! {
         /// `spawn`: hands a new coroutine to the host scheduler
         /// (host-lang): `(dyn) -> dyn` (coroutine, task handle).
         Spawn = 27 => "spawn",
+        /// `dpow` fallback: `(dyn, dyn) -> dyn`.
+        Pow = 28 => "pow",
+        /// `dabs` fallback: `(dyn) -> dyn`.
+        Abs = 29 => "abs",
+        /// `dcall_shape` on a non-callable: `(dyn, dyn, dyn) -> dyn` (callee,
+        /// positional arguments as an array, named arguments as a map from
+        /// name to value). Without it, a call with no named arguments falls
+        /// back to the `call` hook.
+        CallShape = 30 => "call_shape",
     }
 }
 
@@ -525,11 +545,13 @@ pub struct LocalVar {
 pub struct Function {
     pub(crate) name: StrId,
     pub(crate) sig: TypeId,
+    pub(crate) params: Option<ParamList>,
     pub(crate) regs: Vec<ValType>,
     pub(crate) captures: Vec<ValType>,
     pub(crate) names: Vec<StrId>,
     pub(crate) type_refs: Vec<TypeId>,
     pub(crate) tables: Vec<JumpTable>,
+    pub(crate) shapes: Vec<CallShape>,
     pub(crate) handlers: Vec<Handler>,
     pub(crate) code: Vec<Inst>,
     pub(crate) lines: Vec<LineRow>,
@@ -575,6 +597,29 @@ impl Function {
     #[must_use]
     pub fn sig(&self) -> TypeId {
         self.sig
+    }
+
+    /// The function's dynamic-call signature, if it has one (see
+    /// [`ParamList`]); `None` means dynamic calls must pass exactly its
+    /// parameters, positionally.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytecode_lang::{ModuleBuilder, Param, ParamList, ValType};
+    ///
+    /// let mut m = ModuleBuilder::new();
+    /// let x = m.string("x");
+    /// let mut f = m.function("f", &[ValType::Dyn], &[]);
+    /// f.set_params(ParamList::new(vec![Param::normal(x)]));
+    /// f.ret_void();
+    /// let id = m.add_function(f).unwrap();
+    /// let module = m.finish().unwrap();
+    /// assert_eq!(module.function(id).unwrap().params().map(|p| p.params.len()), Some(1));
+    /// ```
+    #[must_use]
+    pub fn params(&self) -> Option<&ParamList> {
+        self.params.as_ref()
     }
 
     /// The declared type of every register; the parameters come first.
@@ -682,6 +727,26 @@ impl Function {
     #[must_use]
     pub fn tables(&self) -> &[JumpTable] {
         &self.tables
+    }
+
+    /// The function's call shapes, indexed by [`ShapeId`](crate::ShapeId).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytecode_lang::{ArgKind, ModuleBuilder};
+    ///
+    /// let mut m = ModuleBuilder::new();
+    /// let mut f = m.function("f", &[], &[]);
+    /// let s = f.call_shape(&[ArgKind::Positional, ArgKind::Spread]);
+    /// f.ret_void();
+    /// let id = m.add_function(f).unwrap();
+    /// let module = m.finish().unwrap();
+    /// assert_eq!(module.function(id).unwrap().shapes()[s.index()].args.len(), 2);
+    /// ```
+    #[must_use]
+    pub fn shapes(&self) -> &[CallShape] {
+        &self.shapes
     }
 
     /// The function's exception-handling regions, innermost first.
@@ -1180,11 +1245,14 @@ impl Module {
 
 /// A runtime error kind with its stable code.
 ///
-/// Codes `E0001`–`E0005` are defined by `specs/OPS.md` §6 for arithmetic
-/// and conversions; `E0100` and up are defined by LSB for the other
-/// instructions. Every execution tier raises the same kind for the same
-/// fault. [`Inst::ErrCode`](crate::Inst::ErrCode) reads the numeric code
-/// back from a caught error value.
+/// Codes `E0001`–`E0099` are defined by `specs/OPS.md` §6 for arithmetic
+/// and conversions, `E0100`–`E0199` by LSB for the other instructions, and
+/// `E0200`–`E0299` by HIR for its own forms (`specs/HIR.md` §8.10). Every
+/// execution tier raises the same kind for the same fault.
+/// [`Inst::ErrCode`](crate::Inst::ErrCode) reads the numeric code back from
+/// a caught error value, and [`Inst::Raise`](crate::Inst::Raise) raises any
+/// catchable kind from bytecode (how a code generator raises HIR's
+/// `NoMatch`).
 ///
 /// # Examples
 ///
@@ -1209,8 +1277,12 @@ pub enum ErrorKind {
     InvalidConversion,
     /// E0005: `char_from_u32` on a value that is not a Unicode scalar value.
     InvalidChar,
+    /// E0006: integer `pow` with a negative exponent under any `overflow`
+    /// policy but `promote` (OPS v2).
+    NegativeExponent,
     /// E0100: a dynamic operation on kinds it does not support, a failed
-    /// `cast` or `from_dyn`, or a dynamic call with the wrong arity.
+    /// `cast` or `from_dyn`, or an argument of a dynamic call that does not
+    /// convert to its parameter's type.
     TypeError,
     /// E0101: a heap instruction on a `nil` reference.
     NullReference,
@@ -1242,6 +1314,16 @@ pub enum ErrorKind {
     /// E0113: a coroutine being closed yielded instead of finishing
     /// (Python's "generator ignored GeneratorExit").
     CloseIgnored,
+    /// E0114: a dynamic call's arguments do not bind to the callee's
+    /// parameters: too many or too few, an unknown or repeated name, a
+    /// positional argument after a named one (see
+    /// [`ParamList::bind`](crate::ParamList::bind)).
+    ArgumentError,
+    /// E0200: a `match` none of whose arms matches (HIR v3 §8.10; Mox's
+    /// `UnhandledMatchError`). No instruction raises it by itself: code
+    /// generators raise it with [`Inst::Raise`](crate::Inst::Raise), the
+    /// scrutinee as payload.
+    NoMatch,
 }
 
 impl ErrorKind {
@@ -1252,6 +1334,7 @@ impl ErrorKind {
         ErrorKind::ShiftOutOfRange,
         ErrorKind::InvalidConversion,
         ErrorKind::InvalidChar,
+        ErrorKind::NegativeExponent,
         ErrorKind::TypeError,
         ErrorKind::NullReference,
         ErrorKind::IndexOutOfBounds,
@@ -1266,6 +1349,8 @@ impl ErrorKind {
         ErrorKind::CannotSuspend,
         ErrorKind::NoScheduler,
         ErrorKind::CloseIgnored,
+        ErrorKind::ArgumentError,
+        ErrorKind::NoMatch,
     ];
 
     /// The stable numeric code (`2` for `E0002`).
@@ -1285,6 +1370,7 @@ impl ErrorKind {
             ErrorKind::ShiftOutOfRange => 3,
             ErrorKind::InvalidConversion => 4,
             ErrorKind::InvalidChar => 5,
+            ErrorKind::NegativeExponent => 6,
             ErrorKind::TypeError => 100,
             ErrorKind::NullReference => 101,
             ErrorKind::IndexOutOfBounds => 102,
@@ -1299,6 +1385,8 @@ impl ErrorKind {
             ErrorKind::CannotSuspend => 111,
             ErrorKind::NoScheduler => 112,
             ErrorKind::CloseIgnored => 113,
+            ErrorKind::ArgumentError => 114,
+            ErrorKind::NoMatch => 200,
         }
     }
 
@@ -1334,6 +1422,7 @@ impl ErrorKind {
             ErrorKind::ShiftOutOfRange => "ShiftOutOfRange",
             ErrorKind::InvalidConversion => "InvalidConversion",
             ErrorKind::InvalidChar => "InvalidChar",
+            ErrorKind::NegativeExponent => "NegativeExponent",
             ErrorKind::TypeError => "TypeError",
             ErrorKind::NullReference => "NullReference",
             ErrorKind::IndexOutOfBounds => "IndexOutOfBounds",
@@ -1348,6 +1437,8 @@ impl ErrorKind {
             ErrorKind::CannotSuspend => "CannotSuspend",
             ErrorKind::NoScheduler => "NoScheduler",
             ErrorKind::CloseIgnored => "CloseIgnored",
+            ErrorKind::ArgumentError => "ArgumentError",
+            ErrorKind::NoMatch => "NoMatch",
         }
     }
 
@@ -1406,6 +1497,13 @@ mod tests {
         }
         assert_eq!(ErrorKind::ArithOverflow.to_string(), "E0001 ArithOverflow");
         assert_eq!(ErrorKind::Unreachable.to_string(), "E0109 Unreachable");
+        assert_eq!(ErrorKind::NoMatch.to_string(), "E0200 NoMatch");
+        assert_eq!(
+            ErrorKind::NegativeExponent.to_string(),
+            "E0006 NegativeExponent"
+        );
+        // Every code fits the one-byte modifier of `raise`.
+        assert!(ErrorKind::ALL.iter().all(|k| k.code() <= 255));
     }
 
     #[test]

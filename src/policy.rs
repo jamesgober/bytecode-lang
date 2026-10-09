@@ -182,6 +182,8 @@ code_enum! {
     /// use bytecode_lang::Shift;
     ///
     /// assert_eq!(Shift::default(), Shift::Error);
+    /// assert_eq!(Shift::from_code(2), Some(Shift::Saturate));
+    /// assert_eq!(Shift::from_code(3), None);
     /// ```
     #[derive(Default)]
     Shift {
@@ -190,6 +192,10 @@ code_enum! {
         Error = 0 => "error",
         /// Use the amount modulo the width (`n & (width - 1)`); never an error.
         Mask = 1 => "mask",
+        /// PHP's rule (OPS v2): an amount at or above the width gives `0`
+        /// (`shr` of a negative signed value gives `-1`); a **negative**
+        /// amount is still `ShiftOutOfRange` (E0003), never masked.
+        Saturate = 2 => "saturate",
     }
 }
 
@@ -214,14 +220,17 @@ code_enum! {
     }
 }
 
-/// The complete OPS policy set, packed into five bits.
+/// The complete OPS policy set, packed into six bits: the modifier byte of
+/// every dynamic arithmetic instruction (`dadd`, `dshl`, `dpow`, ...).
 ///
-/// Layout: bits 0–1 `overflow`, bit 2 `div_zero`, bit 3 `shift`, bit 4
-/// `float_to_int`; bits 5–7 are zero. An instruction carries the whole set
-/// even when only part of it can apply (an `iadd` never divides), so a code
-/// generator stamps one policy per language and type onto every instruction
-/// and the semantics pick the part they need. The default is all-`error`,
-/// the OPS default.
+/// Layout: bits 0–1 `overflow`, bit 2 `div_zero`, bits 3–4 `shift` (the
+/// value 3 is reserved), bit 5 `float_to_int`; bits 6–7 are zero. An
+/// instruction carries the whole set even when only part of it can apply (a
+/// `dadd` never shifts), so a code generator stamps one policy per language
+/// onto every instruction and the semantics pick the part they need. The
+/// default is all-`error`, the OPS default. (Typed integer instructions carry
+/// an [`IntOp`], which has room for every part but `float_to_int`; the
+/// float-to-integer conversions carry a [`FloatConv`].)
 ///
 /// # Examples
 ///
@@ -234,7 +243,8 @@ code_enum! {
 /// assert_eq!(p.to_string(), "wrap.mask");
 /// assert_eq!(Policy::from_bits(p.bits()), Some(p));
 /// assert_eq!(Policy::from_bits(0b11).map(|p| p.overflow()), Some(Overflow::Promote));
-/// assert_eq!(Policy::from_bits(0b10_0000), None); // bit 5 is reserved
+/// assert_eq!(Policy::from_bits(0b1_1000), None); // shift code 3 is reserved
+/// assert_eq!(Policy::from_bits(0b100_0000), None); // bit 6 is reserved
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Policy(u8);
@@ -302,13 +312,15 @@ impl Policy {
     /// use bytecode_lang::{Policy, Shift};
     ///
     /// assert_eq!(Policy::new().with_shift(Shift::Mask).shift(), Shift::Mask);
+    /// assert_eq!(Policy::new().with_shift(Shift::Saturate).shift(), Shift::Saturate);
     /// ```
     #[must_use]
     pub const fn shift(self) -> Shift {
-        if self.0 & 8 == 0 {
-            Shift::Error
-        } else {
-            Shift::Mask
+        match (self.0 >> 3) & 3 {
+            0 => Shift::Error,
+            1 => Shift::Mask,
+            // 3 never survives `from_bits` or `with_shift`.
+            _ => Shift::Saturate,
         }
     }
 
@@ -324,7 +336,7 @@ impl Policy {
     /// ```
     #[must_use]
     pub const fn float_to_int(self) -> FloatToInt {
-        if self.0 & 16 == 0 {
+        if self.0 & 32 == 0 {
             FloatToInt::Error
         } else {
             FloatToInt::Saturate
@@ -370,7 +382,7 @@ impl Policy {
     /// ```
     #[must_use]
     pub const fn with_shift(self, shift: Shift) -> Self {
-        Policy((self.0 & !8) | ((shift as u8) << 3))
+        Policy((self.0 & !0x18) | ((shift as u8) << 3))
     }
 
     /// This policy with `float_to_int` replaced.
@@ -385,10 +397,10 @@ impl Policy {
     /// ```
     #[must_use]
     pub const fn with_float_to_int(self, float_to_int: FloatToInt) -> Self {
-        Policy((self.0 & !16) | ((float_to_int as u8) << 4))
+        Policy((self.0 & !32) | ((float_to_int as u8) << 5))
     }
 
-    /// The packed five-bit form.
+    /// The packed six-bit form.
     ///
     /// # Examples
     ///
@@ -402,20 +414,22 @@ impl Policy {
         self.0
     }
 
-    /// Unpacks a policy, or `None` if a reserved bit (5–7) is set. Every
-    /// 5-bit value names a policy.
+    /// Unpacks a policy, or `None` if a reserved bit (6–7) is set or the
+    /// shift field holds the reserved code 3. 48 of the 64 six-bit values
+    /// name a policy.
     ///
     /// # Examples
     ///
     /// ```
     /// use bytecode_lang::Policy;
     ///
-    /// assert!(Policy::from_bits(0b1_1111).is_some());
-    /// assert!(Policy::from_bits(0b10_0000).is_none());
+    /// assert!(Policy::from_bits(0b11_0111).is_some());
+    /// assert!(Policy::from_bits(0b01_1000).is_none());
+    /// assert!(Policy::from_bits(0b100_0000).is_none());
     /// ```
     #[must_use]
     pub const fn from_bits(bits: u8) -> Option<Self> {
-        if bits & !0x1f != 0 {
+        if bits & !0x3f != 0 || (bits >> 3) & 3 == 3 {
             None
         } else {
             Some(Policy(bits))
@@ -450,8 +464,8 @@ impl fmt::Debug for Policy {
 }
 
 /// Prints only the policies that differ from the default, joined by `.`:
-/// `wrap` / `trap` / `promote` (overflow), `divtrap`, `mask`, `sat`. The default policy
-/// prints as the empty string.
+/// `wrap` / `trap` / `promote` (overflow), `divtrap`, `mask` / `shsat` (shift),
+/// `sat` (float-to-int). The default policy prints as the empty string.
 impl fmt::Display for Policy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut sep = "";
@@ -469,8 +483,10 @@ impl fmt::Display for Policy {
         if self.div_zero() == DivZero::Trap {
             token(f, "divtrap")?;
         }
-        if self.shift() == Shift::Mask {
-            token(f, "mask")?;
+        match self.shift() {
+            Shift::Error => {}
+            Shift::Mask => token(f, "mask")?,
+            Shift::Saturate => token(f, "shsat")?,
         }
         if self.float_to_int() == FloatToInt::Saturate {
             token(f, "sat")?;
@@ -479,21 +495,28 @@ impl fmt::Display for Policy {
     }
 }
 
-/// An integer type plus the complete policy set: the modifier byte of every
-/// integer instruction that computes an integer.
+/// An integer type plus the policies integer arithmetic consults: the
+/// modifier byte of every typed integer instruction that computes an integer.
 ///
-/// Layout: bits 0–2 the [`IntTy`] code, bits 3–7 the [`Policy`].
+/// Layout: bits 0–2 the [`IntTy`] code, bits 3–4 [`Overflow`], bit 5
+/// [`DivZero`], bits 6–7 [`Shift`] (the value 3 is reserved). The
+/// `float_to_int` policy is not here: no integer arithmetic converts a float,
+/// and the conversions that do carry a [`FloatConv`]. Eight types times
+/// 4 × 2 × 3 policies is 192 valid bytes; the other 64 are refused.
 ///
 /// # Examples
 ///
 /// ```
-/// use bytecode_lang::{IntOp, IntTy, Overflow, Policy};
+/// use bytecode_lang::{IntOp, IntTy, Overflow, Policy, Shift};
 ///
 /// let op = IntOp::new(IntTy::I64).with_policy(Policy::new().with_overflow(Overflow::Wrap));
 /// assert_eq!(op.ty(), IntTy::I64);
 /// assert_eq!(op.policy().overflow(), Overflow::Wrap);
 /// assert_eq!(op.to_string(), "i64.wrap");
 /// assert_eq!(IntOp::from_bits(op.bits()), Some(op));
+/// let php = IntOp::new(IntTy::I64).with_policy(Policy::new().with_shift(Shift::Saturate));
+/// assert_eq!(php.to_string(), "i64.shsat");
+/// assert_eq!(IntOp::from_bits(0b1100_0011), None); // shift code 3 is reserved
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IntOp(u8);
@@ -513,7 +536,9 @@ impl IntOp {
         IntOp(ty as u8)
     }
 
-    /// This operation with its policy replaced.
+    /// This operation with its policy replaced by `policy`'s `overflow`,
+    /// `div_zero`, and `shift` (its `float_to_int`, which no integer
+    /// arithmetic consults, is not carried).
     ///
     /// # Examples
     ///
@@ -525,7 +550,10 @@ impl IntOp {
     /// ```
     #[must_use]
     pub const fn with_policy(self, policy: Policy) -> Self {
-        IntOp((self.0 & 7) | (policy.bits() << 3))
+        let p = policy.bits();
+        // overflow (bits 0-1) and div_zero (bit 2) move up by three; shift
+        // moves from bits 3-4 to bits 6-7.
+        IntOp((self.0 & 7) | ((p & 7) << 3) | (((p >> 3) & 3) << 6))
     }
 
     /// The integer type.
@@ -542,7 +570,8 @@ impl IntOp {
         IntTy::from_low3(self.0)
     }
 
-    /// The policy set.
+    /// The policy set: `overflow`, `div_zero`, and `shift` as carried, and
+    /// `float_to_int` at its default (`error`).
     ///
     /// # Examples
     ///
@@ -553,7 +582,7 @@ impl IntOp {
     /// ```
     #[must_use]
     pub const fn policy(self) -> Policy {
-        Policy(self.0 >> 3)
+        Policy(((self.0 >> 3) & 7) | ((self.0 >> 6) << 3))
     }
 
     /// The packed byte.
@@ -570,9 +599,8 @@ impl IntOp {
         self.0
     }
 
-    /// Unpacks the byte. Every byte is an integer type plus a policy, so this
-    /// returns `Some` for all 256 values in format version 1; the `Option`
-    /// leaves room for reserved bits in a later version.
+    /// Unpacks the byte, or `None` if its shift field holds the reserved
+    /// code 3.
     ///
     /// # Examples
     ///
@@ -581,12 +609,14 @@ impl IntOp {
     ///
     /// let op = IntOp::from_bits(0b0001_1011).unwrap(); // i64, overflow = promote
     /// assert_eq!((op.ty(), op.policy().overflow()), (IntTy::I64, Overflow::Promote));
+    /// assert!(IntOp::from_bits(0b1100_0000).is_none());
     /// ```
     #[must_use]
     pub const fn from_bits(bits: u8) -> Option<Self> {
-        match Policy::from_bits(bits >> 3) {
-            Some(_) => Some(IntOp(bits)),
-            None => None,
+        if bits >> 6 == 3 {
+            None
+        } else {
+            Some(IntOp(bits))
         }
     }
 }
@@ -606,6 +636,160 @@ impl fmt::Display for IntOp {
         f.write_str(self.ty().name())?;
         if !self.policy().is_default() {
             write!(f, ".{}", self.policy())?;
+        }
+        Ok(())
+    }
+}
+
+/// The modifier byte of [`Inst::F32ToInt`](crate::Inst::F32ToInt) and
+/// [`Inst::F64ToInt`](crate::Inst::F64ToInt): the destination integer type
+/// and the `float_to_int` policy for NaN and out-of-range values.
+///
+/// Layout: bits 0–2 the destination [`IntTy`], bit 3 [`FloatToInt`]; bits
+/// 4–7 are zero.
+///
+/// # Examples
+///
+/// ```
+/// use bytecode_lang::{FloatConv, FloatToInt, IntTy};
+///
+/// let c = FloatConv::new(IntTy::I32).with_float_to_int(FloatToInt::Saturate);
+/// assert_eq!((c.ty(), c.float_to_int()), (IntTy::I32, FloatToInt::Saturate));
+/// assert_eq!(c.to_string(), "i32.sat");
+/// assert_eq!(FloatConv::from_bits(c.bits()), Some(c));
+/// assert_eq!(FloatConv::from_bits(0b1_0000), None);
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FloatConv(u8);
+
+impl FloatConv {
+    /// A conversion to `ty` with the default policy (`float_to_int = error`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytecode_lang::{FloatConv, IntTy};
+    ///
+    /// assert_eq!(FloatConv::new(IntTy::U8).to_string(), "u8");
+    /// ```
+    #[must_use]
+    pub const fn new(ty: IntTy) -> Self {
+        FloatConv(ty as u8)
+    }
+
+    /// This conversion with its `float_to_int` policy replaced.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytecode_lang::{FloatConv, FloatToInt, IntTy};
+    ///
+    /// let c = FloatConv::new(IntTy::I64).with_float_to_int(FloatToInt::Saturate);
+    /// assert_eq!(c.float_to_int(), FloatToInt::Saturate);
+    /// ```
+    #[must_use]
+    pub const fn with_float_to_int(self, float_to_int: FloatToInt) -> Self {
+        FloatConv((self.0 & 7) | ((float_to_int as u8) << 3))
+    }
+
+    /// This conversion with the `float_to_int` part of `policy` (the one
+    /// policy a float-to-integer conversion consults), so a code generator
+    /// can stamp its language's [`Policy`] everywhere.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytecode_lang::{FloatConv, FloatToInt, IntTy, Policy};
+    ///
+    /// let p = Policy::new().with_float_to_int(FloatToInt::Saturate);
+    /// assert_eq!(FloatConv::new(IntTy::I8).with_policy(p).to_string(), "i8.sat");
+    /// ```
+    #[must_use]
+    pub const fn with_policy(self, policy: Policy) -> Self {
+        self.with_float_to_int(policy.float_to_int())
+    }
+
+    /// The destination integer type.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytecode_lang::{FloatConv, IntTy};
+    ///
+    /// assert_eq!(FloatConv::new(IntTy::U16).ty(), IntTy::U16);
+    /// ```
+    #[must_use]
+    pub const fn ty(self) -> IntTy {
+        IntTy::from_low3(self.0)
+    }
+
+    /// The `float_to_int` policy.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytecode_lang::{FloatConv, FloatToInt, IntTy};
+    ///
+    /// assert_eq!(FloatConv::new(IntTy::I8).float_to_int(), FloatToInt::Error);
+    /// ```
+    #[must_use]
+    pub const fn float_to_int(self) -> FloatToInt {
+        if self.0 & 8 == 0 {
+            FloatToInt::Error
+        } else {
+            FloatToInt::Saturate
+        }
+    }
+
+    /// The packed byte.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytecode_lang::{FloatConv, IntTy};
+    ///
+    /// assert_eq!(FloatConv::new(IntTy::I64).bits(), 3);
+    /// ```
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Unpacks the byte, or `None` if any of bits 4–7 is set.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytecode_lang::FloatConv;
+    ///
+    /// assert!(FloatConv::from_bits(0b1111).is_some());
+    /// assert!(FloatConv::from_bits(0b1_0000).is_none());
+    /// ```
+    #[must_use]
+    pub const fn from_bits(bits: u8) -> Option<Self> {
+        if bits >> 4 != 0 {
+            None
+        } else {
+            Some(FloatConv(bits))
+        }
+    }
+}
+
+impl fmt::Debug for FloatConv {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FloatConv")
+            .field("ty", &self.ty())
+            .field("float_to_int", &self.float_to_int())
+            .finish()
+    }
+}
+
+/// `i64`, then `.sat` when NaN and out-of-range values saturate.
+impl fmt::Display for FloatConv {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.ty().name())?;
+        if self.float_to_int() == FloatToInt::Saturate {
+            f.write_str(".sat")?;
         }
         Ok(())
     }
@@ -883,8 +1067,8 @@ mod tests {
                 assert_eq!(rebuilt, p);
             }
         }
-        // 4 overflow x 2 div_zero x 2 shift x 2 float_to_int.
-        assert_eq!(accepted, 32);
+        // 4 overflow x 2 div_zero x 3 shift x 2 float_to_int.
+        assert_eq!(accepted, 48);
     }
 
     #[test]
@@ -894,9 +1078,40 @@ mod tests {
             if let Some(op) = IntOp::from_bits(bits) {
                 accepted += 1;
                 assert_eq!(IntOp::new(op.ty()).with_policy(op.policy()), op);
+                assert_eq!(op.policy().float_to_int(), FloatToInt::Error);
             }
         }
-        assert_eq!(accepted, 8 * 32);
+        // 8 types x 4 overflow x 2 div_zero x 3 shift.
+        assert_eq!(accepted, 8 * 24);
+    }
+
+    #[test]
+    fn int_op_keeps_every_policy_but_float_to_int() {
+        for bits in 0..=u8::MAX {
+            let Some(p) = Policy::from_bits(bits) else {
+                continue;
+            };
+            for &ty in IntTy::ALL {
+                let op = IntOp::new(ty).with_policy(p);
+                assert_eq!(op.ty(), ty);
+                assert_eq!(op.policy(), p.with_float_to_int(FloatToInt::Error));
+            }
+        }
+    }
+
+    #[test]
+    fn float_conv_round_trips_every_valid_byte() {
+        let mut accepted = 0;
+        for bits in 0..=u8::MAX {
+            if let Some(c) = FloatConv::from_bits(bits) {
+                accepted += 1;
+                assert_eq!(
+                    FloatConv::new(c.ty()).with_float_to_int(c.float_to_int()),
+                    c
+                );
+            }
+        }
+        assert_eq!(accepted, 16);
     }
 
     #[test]
@@ -920,12 +1135,17 @@ mod tests {
             .with_shift(Shift::Mask)
             .with_float_to_int(FloatToInt::Saturate);
         assert_eq!(all.to_string(), "trap.divtrap.mask.sat");
+        let php = Policy::new()
+            .with_overflow(Overflow::Promote)
+            .with_shift(Shift::Saturate);
+        assert_eq!(php.to_string(), "promote.shsat");
+        assert_eq!(Policy::from_bits(php.bits()), Some(php));
         let promote = Policy::new().with_overflow(Overflow::Promote);
         assert_eq!(promote.to_string(), "promote");
         assert_eq!(Policy::from_bits(promote.bits()), Some(promote));
         assert_eq!(
             IntOp::new(IntTy::U64).with_policy(all).to_string(),
-            "u64.trap.divtrap.mask.sat"
+            "u64.trap.divtrap.mask"
         );
     }
 

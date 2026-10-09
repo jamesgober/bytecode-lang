@@ -1,7 +1,7 @@
-lsb 1
+lsb 2
 module s0 "demo"
 start f1
-strings 10
+strings 17
   s0 "demo"
   s1 "demo.mox"
   s2 "hello"
@@ -12,24 +12,35 @@ strings 10
   s7 "counter"
   s8 "sum"
   s9 "main"
-types 4
+  s10 "a"
+  s11 "k"
+  s12 "v"
+  s13 "format"
+  s14 "php.std"
+  s15 "printf"
+  s16 "push"
+types 6
   t0 struct s3 { #0 s4: dyn }
   t1 func (str) -> ()
   t2 func (i64) -> (i64)
   t3 func () -> ()
+  t4 func (dyn, dyn) -> (dyn)
+  t5 func (dyn, dyn, dyn, i64) -> ()
 consts 3
   k0 str s2  ; "hello"
   k1 int 1099511627776
   k2 array [k1, k1]
-imports 1
+imports 2
   imp0 s5 "ls.io" . s6 "print" : t1
+  imp1 s14 "php.std" . s15 "printf" : t4 params (s13, ...map _)
 globals 1
   g0 s7 "counter" : i64 mut = k1
-exports 1
+exports 2
   s9 "main" = f1
+  s16 "push" = f2
 hooks 1
   add = f0
-functions 2
+functions 3
 
 func f0 s8 "sum" : t2
   regs r0:i64 r1:i64 r2:i64 r3:bool r4:i64
@@ -65,3 +76,16 @@ func f1 s9 "main" : t3
   0006 ret_void
 L0:
   0007 throw r4
+
+func f2 s16 "push" : t5
+  params (&s10, s11, s12 = ?) ignore_extra
+  regs r0:dyn r1:dyn r2:dyn r3:i64 r4:dyn r5:dyn r6:dyn r7:dyn r8:bool r9:dyn r10:dyn r11:dyn
+  shape cs0 (_, s11:)
+  0000 cell_get r4, r0
+  0001 dsep_index r5, r4, r1
+  0002 dref_index r6, r5, r2
+  0003 dpow.promote r7, r1, r1
+  0004 load_import r9, imp1  ; "php.std"."printf"
+  0005 dparam_ref r8, r9, r3
+  0006 dcall_shape r9, r9, cs0  ; (_, "k":)
+  0007 raise.E0200 r1  ; NoMatch

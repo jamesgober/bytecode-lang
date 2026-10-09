@@ -1,6 +1,7 @@
 # bytecode-lang &mdash; API Reference
 
-> Complete reference for every public item in `bytecode-lang` 0.2.0, with examples.
+> Complete reference for every public item in `bytecode-lang` 0.3.0 (LSB format version 2), with
+> examples.
 > **Status: pre-1.0.** The surface is designed across the 0.x series and frozen at `1.0`, after a
 > VM runs Mox programs from it (LexerSketch decision D18). The normative format and instruction
 > semantics are in the LexerSketch spec `specs/LSB.md`; this file documents the Rust API.
@@ -19,6 +20,8 @@
   - [Policies](#policies)
   - [Coroutines, generators, async](#coroutines-generators-async)
   - [Dynamic instructions and hooks](#dynamic-instructions-and-hooks)
+  - [Dynamic calls: parameter lists and call shapes](#dynamic-calls-parameter-lists-and-call-shapes)
+  - [Value semantics: separation and references](#value-semantics-separation-and-references)
   - [What decoding checks, and what it does not](#what-decoding-checks-and-what-it-does-not)
 - [Free functions and constants](#free-functions-and-constants)
 - [`ModuleBuilder`](#modulebuilder)
@@ -30,8 +33,10 @@
 - [Module data](#module-data): `Const`, `Import`, `Global`, `Export`, `ExportItem`, `Hook`,
   `Callee`, `HookBinding`, `JumpTable`, `Handler`, `LineRow`, `LocalVar`
 - [Types](#types): `ValType`, `CoroState`, `Kind`, `Prim`, `TypeDef`, `FuncType`, `StructDef`, `Field`, `Method`
+- [Dynamic-call signatures](#dynamic-call-signatures): `ParamList`, `Param`, `ParamKind`,
+  `ParamError`, `CallShape`, `ArgKind`, `ShapeError`, `ArgItem`, `Bound`, `Binding`, `BindError`
 - [Policies and modifiers](#policies-and-modifiers): `IntTy`, `FloatTy`, `Overflow`, `DivZero`,
-  `Shift`, `FloatToInt`, `Policy`, `IntOp`, `IntConv`, `IntPair`
+  `Shift`, `FloatToInt`, `Policy`, `IntOp`, `FloatConv`, `IntConv`, `IntPair`
 - [Instructions](#instructions): `Inst`, `Opcode`, `FieldSpec`, `FieldKind`, `Slot`, `InstError`
 - [Index types](#index-types)
 - [Decoding](#decoding): `Limits`, `Limit`, `DecodeError`, `DecodeErrorKind`
@@ -57,7 +62,8 @@ label-resolved branches.
 | [`Module`](#module), [`Function`](#function) | structs | The read-only module model. |
 | [`Inst`](#inst), [`Opcode`](#opcode) | enums | The instruction set and its metadata. |
 | [`ValType`](#valtype), [`TypeDef`](#typedef-functype-structdef-field-method) | enums | Register types and the type table. |
-| [`IntOp`](#policies-and-modifiers), [`Policy`](#policies-and-modifiers) | structs | Integer types plus OPS policies, carried per instruction. |
+| [`IntOp`](#policies-and-modifiers), [`Policy`](#policies-and-modifiers), [`FloatConv`](#policies-and-modifiers) | structs | Integer types plus OPS policies, carried per instruction. |
+| [`ParamList`](#paramlist), [`CallShape`](#callshape-argkind-shapeerror) | structs | Dynamic-call signatures and call-site layouts; [`ParamList::bind`](#paramlistbind) is the binding rule every tier shares. |
 | [`Limits`](#limits) | struct | Decoding budgets. |
 | [`BuildError`](#builderror), [`DecodeError`](#decodeerror-decodeerrorkind), [`InstError`](#insterror) | errors | Why building or decoding failed. |
 | [`ErrorKind`](#errorkind) | enum | Runtime error kinds and their stable codes, shared by every tier. |
@@ -66,14 +72,14 @@ label-resolved branches.
 
 ```toml
 [dependencies]
-bytecode-lang = "0.2"
+bytecode-lang = "0.3"
 ```
 
 The crate is `no_std` (it needs `alloc`), has no dependencies, and forbids `unsafe`:
 
 ```toml
 [dependencies]
-bytecode-lang = { version = "0.2", default-features = false }
+bytecode-lang = { version = "0.3", default-features = false }
 ```
 
 ## Quick start
@@ -135,10 +141,13 @@ write the result to `dst`; `make_closure` reads its captures the same way; `str_
 ### Policies
 
 Each integer instruction carries an [`IntOp`](#policies-and-modifiers): its operand type and the
-complete OPS policy set ([`Policy`](#policies-and-modifiers): overflow, division by zero, shift
-range, float-to-int). Every tier computes exactly OPS's result under that policy, so
-`iadd.i64.wrap` and `iadd.i64` are different instructions. Dynamic arithmetic carries a `Policy`
-for its integer path. `overflow = promote` (OPS §2, for PHP) produces the nearest `f64` when an
+policies integer arithmetic consults (overflow, division by zero, shift range, `saturate`
+included). Dynamic arithmetic carries a [`Policy`](#policies-and-modifiers) (the complete OPS set,
+float-to-int included) for its integer path, and `f32_to_int`/`f64_to_int` carry a
+[`FloatConv`](#policies-and-modifiers) (type and float-to-int policy). Every tier computes exactly
+OPS's result under that policy, so `iadd.i64.wrap` and `iadd.i64` are different instructions.
+`shift = saturate` is PHP's shift (an amount at or above the width gives 0, or -1 for `>>` of a
+negative value; a negative amount is still an error). `overflow = promote` (OPS §2, for PHP) produces the nearest `f64` when an
 integer result does not fit; it is valid only where the result register is `dyn`, so the builder
 refuses it on a declared static destination ([`BuildError::PromoteNotDynamic`](#builderror)) and
 the verifier (v0.5) refuses it everywhere else.
@@ -151,10 +160,11 @@ explicit key) or `await` (an awaitable for the scheduler), or returns; `resume_t
 raising an error at its suspension point; `coro_close` closes it, running its `finally` blocks;
 `coro_key` and `coro_result` read its last key and its return value; `coro_status` reads its
 [`CoroState`](#corostate); `spawn` hands a new coroutine to the host scheduler through the `spawn`
-[hook](#module-data). Values crossing a suspension are `dyn`. The
-instructions are part of format version 1 (decoded, encoded, disassembled); executing them is
-bvm-lang 2.0's job. The full model, including what a suspended coroutine owns and how the GC traces
-it, is `specs/LSB.md` §5.13.
+[hook](#module-data). Values crossing a suspension are `dyn`. A `yield` without a key uses PHP's
+generator rule: one more than the largest integer key yielded so far, never below 0 (after only
+`yield -5 => x` the next automatic key is 0; format version 1 said -4). bvm-lang 2.0 executes the
+coroutine instructions; this crate defines, encodes, decodes, and disassembles them. The full
+model, including what a suspended coroutine owns and how the GC traces it, is `specs/LSB.md` §5.13.
 
 ```rust
 use bytecode_lang::{decode, encode, Inst, ModuleBuilder, ValType};
@@ -185,7 +195,91 @@ assert_eq!(decode(&encode(&module)).unwrap(), module);
 `dadd`, `deq`, `get_prop`, `dcall`, and the other `d*` instructions work on `dyn` registers. Numbers
 take a built-in fast path; every other combination calls the module's [`Hook`](#module-data) for
 that operation, through which a language supplies its own semantics (PHP's loose `==`, Python's
-list equality), or raises `TypeError` when none is bound.
+list equality), or raises `TypeError` when none is bound. `dpow` and `dabs` (with their `pow` and
+`abs` hooks) complete the OPS v2 operations on dynamic values. The names of the two "not"s follow
+HIR: `dnot` is the logical not (PHP `!`), `dbit_not` the bitwise complement (PHP `~`), and
+`ibit_not` the typed complement.
+
+A `dyn` float holds one canonical NaN (`0x7FF8_0000_0000_0000`), so NaN sign and payload are not
+observable on dynamic values: unboxing and `float_to_bits` always see that NaN, and `ftotal_cmp`
+orders it as a positive NaN (`specs/LSB.md` §5.6).
+
+### Dynamic calls: parameter lists and call shapes
+
+A function or an import may carry a [`ParamList`](#paramlist): names, kinds (positional-only,
+normal, named-only, rest, rest map, named rest), by-reference flags, and defaults, with a trailing
+`i64` presence mask in the signature when a parameter has a default. A `dcall_shape` call site
+names a [`CallShape`](#callshape-argkind-shapeerror) saying which window registers are positional,
+named, or spread. The VM binds one to the other by one rule, which
+[`ParamList::bind`](#paramlistbind) implements; `dcall` is the all-positional case.
+`dparam_ref`/`dparam_ref_named` tell a PHP code generator, at run time, whether to send a reference
+for an argument. `load_import` makes any import a first-class function value.
+
+```rust
+use bytecode_lang::{
+    ArgKind, decode, disassemble, encode, Inst, ModuleBuilder, Param, ParamKind, ParamList, Prim,
+    Reg, ValType,
+};
+
+let mut m = ModuleBuilder::new();
+let (format, flag) = (m.string("format"), m.string("flag"));
+let d = ValType::Dyn;
+// The host's printf(string $format, mixed ...$values), usable as a value.
+let sig = m.func_type(&[d, d], &[d]);
+let printf = m.import_with_params(
+    "php.std",
+    "printf",
+    sig,
+    ParamList::new(vec![Param::normal(format), Param::new(ParamKind::RestMap, None)]),
+);
+// $f(...$args, flag: true), with $f = 'printf' resolved to the host function
+let mut f = m.function("call", &[d], &[d]);
+let (callee, yes) = (f.reg(d), f.reg(ValType::Bool));
+let window = f.regs(&[d, d, d]); // result, the spread, the named argument
+f.emit(Inst::LoadImport { dst: callee, import: printf });
+f.mov(Reg(window.0 + 1), f.param(0));
+f.emit(Inst::LoadBool { dst: yes, val: true });
+f.emit(Inst::ToDyn { dst: Reg(window.0 + 2), src: yes, from: Prim::Bool });
+f.dcall_shape(window, callee, &[ArgKind::Spread, ArgKind::Named(flag)]);
+f.ret(window);
+let id = m.add_function(f).unwrap();
+let module = m.finish().unwrap();
+assert_eq!(decode(&encode(&module)).unwrap(), module);
+assert_eq!(module.function(id).unwrap().shapes()[0].args, [ArgKind::Spread, ArgKind::Named(flag)]);
+assert!(disassemble(&module).contains("params (s0, ...map _)"));
+```
+
+### Value semantics: separation and references
+
+PHP arrays are values: a code generator `dup`s a container on every transfer (O(1), copy-on-write).
+For a nested write (`$a[$k][] = $v`), `dsep_index` makes `$a[$k]` safe to write in place, copying
+it only when another container may share it; `dsep_prop` does the same for a property. References
+(PHP `&`) are boxes of kind `reference`: `new_ref` makes one, `dref_index`/`dref_prop` make a map
+slot or property into one (`&$a['k']`, `foreach ($a as &$v)`), `dbind_index`/`dbind_prop` bind a
+slot to an existing one (`$a['k'] = &$x`), and `dunref_index`/`dunref_prop` unbind it. A slot
+holding a reference is transparent: reads and writes go through to the reference's value, and
+copies of the container share the reference, as in PHP. `cell_get`/`cell_set` read and write a
+reference (`specs/LSB.md` §5.16–5.17).
+
+```rust
+use bytecode_lang::{disassemble, Inst, ModuleBuilder, Policy, ValType};
+
+// function push(&$a, $k, $v) { $a[$k][] = $v; return $a[$k]; }  (the core of it)
+let d = ValType::Dyn;
+let mut m = ModuleBuilder::new();
+let mut f = m.function("push", &[d, d, d], &[d]);
+let (a, k, v) = (f.param(0), f.param(1), f.param(2));
+let (arr, inner, slot) = (f.reg(d), f.reg(d), f.reg(d));
+f.emit(Inst::CellGet { dst: arr, cell: a }); // $a is a reference
+f.emit(Inst::DSepIndex { dst: inner, obj: arr, key: k }); // $a[$k], unshared
+f.emit(Inst::DRefIndex { dst: slot, obj: inner, key: v }); // &$a[$k][$v]
+f.emit(Inst::DAbs { dst: v, src: v, pol: Policy::new() });
+f.ret(inner);
+m.add_function(f).unwrap();
+let text = disassemble(&m.finish().unwrap());
+assert!(text.contains("dsep_index r4, r3, r1"));
+assert!(text.contains("dref_index r5, r4, r2"));
+```
 
 ### What decoding checks, and what it does not
 
@@ -293,11 +387,12 @@ assert!(text.contains("L0:\n  0000 safepoint\n  0001 jmp L0\n"));
 
 ```rust,ignore
 pub const MAGIC: [u8; 4] = *b"LSB\0";
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 ```
 
 Every encoded module starts with `MAGIC` followed by `FORMAT_VERSION` (little-endian). The decoder
-accepts exactly this version.
+accepts exactly this version; a version 1 file (bytecode-lang 0.2) is refused with
+`UnsupportedVersion(1)` and must be regenerated (`specs/LSB.md` §7.4 lists the changes).
 
 ```rust
 use bytecode_lang::{encode, ModuleBuilder, FORMAT_VERSION, MAGIC};
@@ -441,6 +536,33 @@ let print = m.import("ls.io", "print", sig);
 assert_eq!(m.finish().unwrap().import(print).unwrap().sig, sig);
 ```
 
+### `ModuleBuilder::import_with_params`
+
+```rust,ignore
+pub fn import_with_params(&mut self, module: &str, name: &str, sig: TypeId, params: ParamList) -> ImportId
+```
+
+Adds a host function with a dynamic-call signature, so it can be a first-class value taking named,
+spread, extra, missing, and by-reference arguments through `dcall`/`dcall_shape`. `sig` must
+already be a function type of this builder; the list is checked by
+[`ParamList::validate`](#paramlist) and [`ParamList::fits`](#paramlist) against it.
+
+**Errors** (reported by [`finish`](#modulebuilderfinish)): `InvalidParams { owner: Callee::Import(id), error }`.
+
+```rust
+use bytecode_lang::{BuildError, Callee, ModuleBuilder, Param, ParamError, ParamList, ValType};
+
+let mut m = ModuleBuilder::new();
+let x = m.string("x");
+let sig = m.func_type(&[ValType::Dyn], &[]); // no room for the presence mask
+let list = ParamList::new(vec![Param::normal(x).with_default()]);
+let id = m.import_with_params("host", "f", sig, list);
+assert_eq!(
+    m.finish().unwrap_err(),
+    BuildError::InvalidParams { owner: Callee::Import(id), error: ParamError::Signature { index: 1 } },
+);
+```
+
 ### `ModuleBuilder::global`
 
 ```rust,ignore
@@ -478,7 +600,9 @@ places it in its slot.
 
 **Errors:** the first error the builder recorded; `UnboundLabel`; `TargetOutOfRange` (a raw target
 past the end, or a branch to a label bound after the last instruction); `InvalidRange`;
-`ForeignFunction` (not declared by this builder).
+`InvalidParams` (the parameter list breaks its rules or does not fit the signature);
+`InvalidShape` (a malformed call shape); `PromoteNotDynamic`; `ForeignFunction` (not declared by
+this builder).
 
 ```rust
 use bytecode_lang::{BuildError, FuncId, Inst, ModuleBuilder, Target};
@@ -621,6 +745,58 @@ let out = f.reg(ValType::Dyn);
 let name = f.name_ref(x);
 f.emit(Inst::GetProp { dst: out, obj, name });
 f.ret(out);
+assert!(m.add_function(f).is_ok());
+```
+
+### `FunctionBuilder::set_params`
+
+```rust,ignore
+pub fn set_params(&mut self, list: ParamList)
+```
+
+Gives the function a dynamic-call signature ([`ParamList`](#paramlist)), checked when the function
+is added: its own rules, and that it fits the signature (one parameter per entry, a trailing `i64`
+presence mask when an entry has a default, rest parameters `dyn`, by-reference parameters `dyn` or
+`ref`). Violations: `InvalidParams { owner: Callee::Func(id), error }`.
+
+```rust
+use bytecode_lang::{ModuleBuilder, Param, ParamKind, ParamList, ValType};
+
+// PHP: function f($x, $y = 1, ...$rest)
+let mut m = ModuleBuilder::new();
+let (x, y) = (m.string("x"), m.string("y"));
+let d = ValType::Dyn;
+let mut f = m.function("f", &[d, d, d, ValType::I64], &[]);
+f.set_params(ParamList::new(vec![
+    Param::normal(x),
+    Param::normal(y).with_default(),
+    Param::new(ParamKind::RestMap, None),
+]));
+f.ret_void();
+assert!(m.add_function(f).is_ok());
+```
+
+### `FunctionBuilder::call_shape`, `dcall_shape`
+
+```rust,ignore
+pub fn call_shape(&mut self, args: &[ArgKind]) -> ShapeId
+pub fn dcall_shape(&mut self, dst: Reg, callee: Reg, args: &[ArgKind]) -> u32
+```
+
+`call_shape` interns a [`CallShape`](#callshape-argkind-shapeerror) in the function's shape table
+(deduplicated; 65,536 at most, then `TooMany { what: "call shapes" }`); a malformed shape records
+`InvalidShape`. `dcall_shape` interns the shape and emits `dcall_shape dst, callee, csN`, whose
+window `dst+1 ..= dst+args.len()` holds the arguments.
+
+```rust
+use bytecode_lang::{ArgKind, ModuleBuilder, ShapeId, ValType};
+
+let mut m = ModuleBuilder::new();
+let name = m.string("name");
+let mut f = m.function("f", &[ValType::Dyn], &[]);
+assert_eq!(f.call_shape(&[ArgKind::Positional, ArgKind::Named(name)]), ShapeId(0));
+assert_eq!(f.call_shape(&[ArgKind::Positional, ArgKind::Named(name)]), ShapeId(0));
+f.ret_void();
 assert!(m.add_function(f).is_ok());
 ```
 
@@ -767,6 +943,8 @@ pub enum BuildError { /* ... */ }
 | `TooMany { func, what }` | A per-function table is full (registers, captures, name refs, type refs, parameters, ...). |
 | `UnknownRegister { func, reg }` | A move cycle passes an undeclared register. |
 | `ConflictingMoves { func, dst }` | A parallel move writes one register twice. |
+| `InvalidParams { owner, error }` | A function's or import's [`ParamList`](#paramlist) breaks its rules or does not fit its signature ([`ParamError`](#paramerror)). |
+| `InvalidShape { func, error }` | A malformed [`CallShape`](#callshape-argkind-shapeerror) ([`ShapeError`](#callshape-argkind-shapeerror)). |
 | `ForeignFunction(id)` | A function builder not declared by this module builder. |
 | `UndefinedFunction(id)` | Declared, never added. |
 | `UndefinedType(id)` | Reserved, never defined (or defined twice). |
@@ -812,10 +990,12 @@ One function, read-only. `Clone`, `PartialEq`, `Eq`, `Debug`.
 | Method | Returns |
 |---|---|
 | `name() -> StrId`, `sig() -> TypeId` | name and signature |
+| `params() -> Option<&ParamList>` | the dynamic-call signature, if any |
 | `regs() -> &[ValType]` | register types; parameters first |
 | `captures() -> &[ValType]` | captured value types |
 | `names() -> &[StrId]`, `type_refs() -> &[TypeId]` | the per-function lists `NameRef`/`TypeRef` index |
 | `tables() -> &[JumpTable]` | jump tables |
+| `shapes() -> &[CallShape]` | call shapes, indexed by `ShapeId` |
 | `handlers() -> &[Handler]` | try regions, innermost first |
 | `code() -> &[Inst]` | the instructions |
 | `lines() -> &[LineRow]`, `locals() -> &[LocalVar]` | debug information |
@@ -825,11 +1005,11 @@ One function, read-only. `Clone`, `PartialEq`, `Eq`, `Debug`.
 | Type | Fields / variants | Notes |
 |---|---|---|
 | `Const` | `Bool(bool)`, `Int(i64)`, `UInt(u64)`, `F32(u32)`, `F64(u64)`, `Char(char)`, `Str(StrId)`, `Bytes(Vec<u8>)`, `Array(Vec<ConstId>)`, `Map(Vec<(ConstId, ConstId)>)` | floats as IEEE bits; `Const::f32(v)`, `Const::f64(v)` build them; aggregates refer to earlier constants; `Display` |
-| `Import` | `module`, `name: StrId`, `sig: TypeId` | |
+| `Import` | `module`, `name: StrId`, `sig: TypeId`, `params: Option<ParamList>` | `Clone` (no longer `Copy`, since 0.3); `load_import` makes a function value of it |
 | `Global` | `name`, `ty: ValType`, `mutable: bool`, `init: Option<ConstId>` | |
 | `Export` | `name: StrId`, `item: ExportItem` | |
 | `ExportItem` | `Func(FuncId)`, `Global(GlobalId)`, `Type(TypeId)` | |
-| `Hook` | 28 operations, codes 0–27 (`Add` … `Call`, `Spawn`) | code enum: `ALL`, `from_code`, `code`, `name` |
+| `Hook` | 31 operations, codes 0–30 (`Add` … `Call`, `Spawn`, `Pow`, `Abs`, `CallShape`) | code enum: `ALL`, `from_code`, `code`, `name` |
 | `Callee` | `Func(FuncId)`, `Import(ImportId)` | |
 | `HookBinding` | `hook: Hook`, `callee: Callee` | |
 | `JumpTable` | `targets: Vec<Target>`, `default: Target` | |
@@ -843,8 +1023,9 @@ use bytecode_lang::{Const, Hook};
 assert_eq!(Const::f64(1.5).to_string(), "f64 1.5");
 assert_eq!(Const::Bytes(vec![0xff]).to_string(), "bytes b\"\\xff\"");
 assert_eq!(Hook::from_code(18), Some(Hook::Concat));
-assert_eq!(Hook::ALL.len(), 28);
+assert_eq!(Hook::ALL.len(), 31);
 assert_eq!(Hook::Spawn.code(), 27);
+assert_eq!(Hook::CallShape.code(), 30);
 ```
 
 ## Types
@@ -878,8 +1059,9 @@ assert!(!CoroState::Returned.is_resumable());
 
 ### `Kind`, `Prim`
 
-`Kind`: the 14 dynamic kinds (`Nil` = 0 … `Error` = 12, `Coroutine` = 13), returned by `type_of` and tested by
-`is_kind`. `Prim`: the 14 static representations crossing the `dyn` boundary (`Bool` … `Char`,
+`Kind`: the 15 dynamic kinds (`Nil` = 0 … `Error` = 12, `Coroutine` = 13, `Reference` = 14),
+returned by `type_of` and tested by `is_kind`. A `Reference` is PHP's `&`: a box holding one
+`dyn` value, transparent in container slots (`specs/LSB.md` §5.17). `Prim`: the 14 static representations crossing the `dyn` boundary (`Bool` … `Char`,
 `Str`, `Ref`), the modifier of `to_dyn`/`from_dyn`. Both are code enums (`ALL`, `from_code`,
 `code`, `name`, `Display`).
 
@@ -898,6 +1080,94 @@ let sig = TypeDef::Func(FuncType { params: vec![ValType::Dyn], results: vec![Val
 assert_eq!(sig.to_string(), "func (dyn) -> (bool)");
 ```
 
+## Dynamic-call signatures
+
+The binding of a dynamic call (`dcall`, `dcall_shape`) to its callee, `specs/LSB.md` §5.15.
+
+### `ParamList`
+
+```rust,ignore
+pub struct ParamList { pub params: Vec<Param>, pub ignore_extra: bool }
+```
+
+The dynamic-call signature of a function or import. `Clone`, `Eq`, `Ord`, `Hash`, `Debug`,
+`Default`, `Display` (`(&s1, s2 = ?, ...map _) ignore_extra`).
+
+| Method | |
+|---|---|
+| `new(params) -> ParamList` | a list raising on extra arguments |
+| `ignoring_extra(self) -> ParamList` | extra positional arguments are dropped (PHP user functions) |
+| `has_defaults() -> bool` | whether the signature ends with the `i64` presence mask |
+| `signature_len() -> usize` | entries, plus one for the presence mask |
+| `validate() -> Result<(), ParamError>` | the list's own rules: at most 255 entries (64 with a default); kinds in order (positional-only, normal, one `Rest`/`RestMap`, named-only, one `RestNamed`); normal and named-only entries named; names unique; no default on a rest |
+| `fits(&[ValType]) -> Result<(), ParamError>` | fits a signature: one parameter per entry, the trailing `i64` mask, rest parameters `dyn`, by-reference parameters `dyn` or `ref` |
+| `positional_by_ref(pos: u64) -> bool` | the semantics of `dparam_ref` |
+| `named_by_ref(&Module, name: &[u8]) -> bool` | the semantics of `dparam_ref_named` |
+| `bind(&Module, &[ArgItem]) -> Result<Binding, BindError>` | the binding rule (below) |
+
+### `ParamList::bind`
+
+```rust,ignore
+pub fn bind(&self, module: &Module, items: &[ArgItem<'_>]) -> Result<Binding, BindError>
+```
+
+Binds a dynamic call's arguments (after spreads were expanded into items) to the list: positional
+items fill the positional-only and normal parameters in order, extras go to the rest parameter or
+are dropped under `ignore_extra` or are `TooMany`; a positional item after a named one is
+`PositionalAfterNamed`; a named item fills the normal or named-only parameter of that name
+(`Duplicate` if filled), else the named rest, else the rest map, else `UnknownName`; an empty
+parameter takes its default or is `Missing`. `module` is the callee's module (parameter names are
+its strings). `O(items × params)` plus `O(n log n)` for rest-collected names. A VM raises
+`ArgumentError` (E0114) for every `BindError`.
+
+```rust
+use bytecode_lang::{ArgItem, BindError, Bound, ModuleBuilder, Param, ParamList};
+
+let mut m = ModuleBuilder::new();
+let (a, b) = (m.string("a"), m.string("b"));
+let module = m.finish().unwrap();
+let list = ParamList::new(vec![Param::normal(a), Param::normal(b).with_default()]);
+let bound = list.bind(&module, &[ArgItem::Named(b"b"), ArgItem::Named(b"a")]).unwrap();
+assert_eq!(bound.slots(), &[Bound::Arg(1), Bound::Arg(0)]);
+assert_eq!(bound.presence(), 0b11);
+assert_eq!(
+    list.bind(&module, &[ArgItem::Positional, ArgItem::Named(b"a")]),
+    Err(BindError::Duplicate { item: 1 }),
+);
+```
+
+### `Param`, `ParamKind`
+
+`Param { name: Option<StrId>, kind: ParamKind, by_ref: bool, default: bool }` with `new(kind,
+name)`, `normal(name)`, `by_ref()`, `with_default()`. `ParamKind` is a code enum:
+`PositionalOnly` (0), `Normal` (1), `NamedOnly` (2), `Rest` (3, a `dyn` array of extra positional
+arguments), `RestMap` (4, a `dyn` map of extra positional arguments under `0, 1, ...` and, without
+a `RestNamed`, unknown named ones under their names), `RestNamed` (5, a `dyn` map of unknown named
+arguments); `is_rest()`, `takes_names()`.
+
+### `ParamError`
+
+Why a list is invalid: `TooMany`, `OutOfOrder { index }`, `Unnamed { index }`,
+`DuplicateName { index }`, `RestDefault { index }`, `Signature { index }`. `#[non_exhaustive]`,
+`Display`, `Error`.
+
+### `CallShape`, `ArgKind`, `ShapeError`
+
+`CallShape { args: Vec<ArgKind> }` (`new`, `validate`, `Display` `(_, s3:, ..., **)`), one entry per
+window register of a `dcall_shape`. `ArgKind`: `Positional`, `Named(StrId)`, `Spread` (an array's
+elements positionally; a map's int-keyed values positionally and str-keyed ones by name),
+`SpreadNamed` (a map with `str` keys only). `validate` checks at most 255 entries, no positional
+entry or spread after a named entry or named spread, and no repeated name; violations are
+`ShapeError::{TooMany, PositionalAfterNamed { index }, DuplicateName { index }}`
+(`#[non_exhaustive]`).
+
+### `ArgItem`, `Bound`, `Binding`, `BindError`
+
+`ArgItem::{Positional, Named(&[u8])}` is one argument as `bind` sees it. `Binding` has `slots() ->
+&[Bound]` (per parameter: `Arg(item)`, `Default`, or `Collected(Vec<item>)`) and `presence() ->
+u64`. `BindError::{TooMany { item }, PositionalAfterNamed { item }, UnknownName { item },
+Duplicate { item }, Missing { param }}` (`#[non_exhaustive]`, `Display`, `Error`).
+
 ## Policies and modifiers
 
 | Type | Values / layout | Methods |
@@ -906,10 +1176,11 @@ assert_eq!(sig.to_string(), "func (dyn) -> (bool)");
 | `FloatTy` | `F32`, `F64` | code enum |
 | `Overflow` | `Error` (default), `Wrap`, `Trap`, `Promote` (codes 0–3) | code enum; `Promote` (OPS §2): the nearest `f64` when the integer result does not fit, valid only with a `dyn` destination |
 | `DivZero` | `Error` (default), `Trap` | code enum |
-| `Shift` | `Error` (default), `Mask` | code enum |
+| `Shift` | `Error` (default), `Mask`, `Saturate` (PHP: an amount at or above the width gives 0, or -1 for `>>` of a negative value; a negative amount is still `ShiftOutOfRange`) | code enum |
 | `FloatToInt` | `Error` (default), `Saturate` | code enum |
-| `Policy` | 5 bits: overflow (2), div_zero, shift, float_to_int | `new`, `DEFAULT`, getters, `with_*`, `bits`, `from_bits` (every 5-bit value is valid), `is_default`; `Display` lists non-defaults (`wrap.mask`, `promote`) |
-| `IntOp` | `IntTy` + `Policy` in one byte | `new(ty)`, `with_policy`, `ty`, `policy`, `bits`, `from_bits`; `Display` `i64.wrap` |
+| `Policy` | 6 bits: overflow (2), div_zero (1), shift (2; code 3 reserved), float_to_int (1): 48 valid values | `new`, `DEFAULT`, getters, `with_*`, `bits`, `from_bits`, `is_default`; `Display` lists non-defaults (`wrap.mask`, `promote.shsat`, `sat`) |
+| `IntOp` | `IntTy` (3 bits) + overflow (2) + div_zero (1) + shift (2): 192 valid bytes | `new(ty)`, `with_policy` (keeps every part but `float_to_int`), `ty`, `policy` (`float_to_int` reads as `Error`), `bits`, `from_bits`; `Display` `i64.wrap` |
+| `FloatConv` | `IntTy` (3 bits) + float_to_int (1): the modifier of `f32_to_int`/`f64_to_int` | `new(ty)`, `with_float_to_int`, `with_policy`, `ty`, `float_to_int`, `bits`, `from_bits`; `Display` `i32.sat` |
 | `IntConv` | from, to, overflow | `new`, `from`, `to`, `overflow`, `bits`, `from_bits` |
 | `IntPair` | from, to | `new`, `from`, `to`, `bits`, `from_bits` |
 
@@ -930,7 +1201,7 @@ assert_eq!(IntOp::from_bits(op.bits()), Some(op));
 ### `Inst`
 
 ```rust,ignore
-pub enum Inst { Nop {}, Mov { dst: Reg, src: Reg }, /* 182 variants */ }
+pub enum Inst { Nop {}, Mov { dst: Reg, src: Reg }, /* 200 variants */ }
 ```
 
 One instruction, eight bytes, `Copy`, `Eq`, `Hash`, `Debug`, `Display`. Deliberately exhaustive:
@@ -961,7 +1232,8 @@ assert_eq!(i.to_string(), "imul.i32 r0, r1, r2");
 ### `FieldSpec`, `FieldKind`, `Slot`
 
 `FieldSpec { name, kind, slot }` describes one operand. `FieldKind` is what it is (`Reg`, `Target`,
-`Const`, … `IntOp`, `Kind`, `Prim`) with `is_modifier` and `bits`. `Slot` is where it sits (`A`,
+`Const`, … `Shape`, … `IntOp`, `FloatConv`, `Kind`, `Prim`, `ErrKind`) with `is_modifier` and
+`bits`. `Slot` is where it sits (`A`,
 `B`, `C`, `D`, `W`) with `shift` and `width`. This metadata is enough to write an assembler, a
 generator of test instructions, or a VM dispatch table.
 
@@ -982,7 +1254,8 @@ assert_eq!((f[1].kind, f[1].slot), (FieldKind::Func, Slot::W));
 
 `Reg(u16)` `r3` · `Target(u32)` `@3` · `ConstId(u32)` `k3` · `FuncId(u32)` `f3` · `ImportId(u32)`
 `imp3` · `GlobalId(u32)` `g3` · `TypeId(u32)` `t3` · `StrId(u32)` `s3` · `NameRef(u16)` `n3` ·
-`TypeRef(u16)` `ty3` · `TableId(u32)` `jt3` · `FieldIdx(u16)` `#3` · `UpvalIdx(u16)` `u3`.
+`TypeRef(u16)` `ty3` · `TableId(u32)` `jt3` · `ShapeId(u16)` `cs3` · `FieldIdx(u16)` `#3` ·
+`UpvalIdx(u16)` `u3`.
 Public newtypes with `index() -> usize`, `Copy`, `Ord`, `Hash`, `Default`, and the `Display`
 shown.
 
@@ -1004,14 +1277,15 @@ shown.
 | `max_total_insts` | 33,554,432 | instructions per module |
 | `max_items` | 16,777,216 | every other list (imports, globals, exports, parameters, methods, constant elements, byte-string constant lengths, jump-table entries, handlers, line rows, locals) |
 
-Registers, captures, name refs, type refs, and struct fields are also capped at 65,536 by the
-format (`Limit::PerFunction`). Independently of these, no list is reserved before the remaining
+Registers, captures, name refs, type refs, call shapes, and struct fields are also capped at
+65,536 by the format (`Limit::PerFunction`), and parameter lists and call shapes at 255 entries
+(`Limit::Arity`). Independently of these, no list is reserved before the remaining
 input is long enough to hold it.
 
 ### `Limit`
 
 Which budget was hit: `Bytes`, `Strings`, `Types`, `Consts`, `ConstDepth`, `Functions`, `Insts`,
-`TotalInsts`, `Items`, `PerFunction`. `#[non_exhaustive]`, `Display`.
+`TotalInsts`, `Items`, `PerFunction`, `Arity`. `#[non_exhaustive]`, `Display`.
 
 ### `DecodeError`, `DecodeErrorKind`
 
@@ -1022,14 +1296,14 @@ Which budget was hit: `Bytes`, `Strings`, `Types`, `Consts`, `ConstDepth`, `Func
 |---|---|
 | `UnexpectedEnd` | the input ends before a value it promises (including counts the remaining bytes cannot hold) |
 | `BadMagic` | not `LSB\0` |
-| `UnsupportedVersion(v)` | not format version 1 |
+| `UnsupportedVersion(v)` | not format version 2 |
 | `ReservedFlags(v)` | non-zero header flags |
 | `SectionOutOfOrder { expected, found }` | sections must be ids 1–10 in order |
 | `SectionLength(id)` | a section's contents do not fill its length exactly |
 | `TrailingBytes` | bytes after section 10 |
 | `LimitExceeded(Limit)` | a budget |
 | `InvalidUtf8` | a string-table entry |
-| `InvalidTag { what, tag }` | a tag byte naming nothing (value type, type, constant, boolean, option, export, hook, callee) |
+| `InvalidTag { what, tag }` | a tag byte naming nothing (value type, type, constant, boolean, option, export, hook, callee, parameter list flags, parameter kind, parameter flags, call shape argument) |
 | `InvalidChar(v)` | a `char` constant that is not a scalar value |
 | `ConstForwardRef { index, child }` | an aggregate constant refers to itself or a later one |
 | `HookOrder` | hook bindings not strictly increasing |
@@ -1040,12 +1314,14 @@ Which budget was hit: `Bytes`, `Strings`, `Types`, `Consts`, `ConstDepth`, `Func
 
 Runtime error kinds with stable codes, shared by every execution tier (OPS §6 and LSB §6):
 `ArithOverflow` (E0001), `DivByZero` (E0002), `ShiftOutOfRange` (E0003), `InvalidConversion`
-(E0004), `InvalidChar` (E0005), `TypeError` (E0100), `NullReference` (E0101), `IndexOutOfBounds`
-(E0102), `KeyNotFound` (E0103), `UndefinedProperty` (E0104), `StackOverflow` (E0105),
-`OutOfMemory` (E0106), `OutOfFuel` (E0107), `InvalidStrIndex` (E0108), `Unreachable` (E0109),
-`InvalidCoroState` (E0110), `CannotSuspend` (E0111), `NoScheduler` (E0112), `CloseIgnored` (E0113).
-Methods: `ALL`, `code`, `from_code`, `name`, `is_catchable` (false for `OutOfMemory`, `OutOfFuel`,
-`Unreachable`). `#[non_exhaustive]`.
+(E0004), `InvalidChar` (E0005), `NegativeExponent` (E0006), `TypeError` (E0100), `NullReference`
+(E0101), `IndexOutOfBounds` (E0102), `KeyNotFound` (E0103), `UndefinedProperty` (E0104),
+`StackOverflow` (E0105), `OutOfMemory` (E0106), `OutOfFuel` (E0107), `InvalidStrIndex` (E0108),
+`Unreachable` (E0109), `InvalidCoroState` (E0110), `CannotSuspend` (E0111), `NoScheduler` (E0112),
+`CloseIgnored` (E0113), `ArgumentError` (E0114), `NoMatch` (E0200, HIR's: raised by code
+generators with `raise`). OPS owns E0001–E0099, LSB E0100–E0199, HIR E0200–E0299. Methods: `ALL`,
+`code`, `from_code`, `name`, `is_catchable` (false for `OutOfMemory`, `OutOfFuel`, `Unreachable`).
+`#[non_exhaustive]`. Every code fits one byte, the modifier of `raise`.
 
 ```rust
 use bytecode_lang::ErrorKind;
@@ -1056,7 +1332,7 @@ assert_eq!(ErrorKind::from_code(2), Some(ErrorKind::DivByZero));
 
 ## Instruction table
 
-Every instruction of format version 1, generated from `Opcode::fields`. Modifiers print as mnemonic
+Every instruction of format version 2, generated from `Opcode::fields`. Modifiers print as mnemonic
 suffixes; operands print in the order shown. Semantics and typing rules: `specs/LSB.md` §5. A test
 checks that this table lists every opcode.
 
@@ -1088,7 +1364,7 @@ checks that this table lists every opcode.
 | 0x1C | `imin` | op:IntOp | dst reg, lhs reg, rhs reg |
 | 0x1D | `imax` | op:IntOp | dst reg, lhs reg, rhs reg |
 | 0x1E | `ineg` | op:IntOp | dst reg, src reg |
-| 0x1F | `inot` | op:IntOp | dst reg, src reg |
+| 0x1F | `ibit_not` | op:IntOp | dst reg, src reg |
 | 0x20 | `iabs` | op:IntOp | dst reg, src reg |
 | 0x21 | `ieq` | ty:IntTy | dst reg, lhs reg, rhs reg |
 | 0x22 | `ine` | ty:IntTy | dst reg, lhs reg, rhs reg |
@@ -1096,6 +1372,7 @@ checks that this table lists every opcode.
 | 0x24 | `ile` | ty:IntTy | dst reg, lhs reg, rhs reg |
 | 0x25 | `igt` | ty:IntTy | dst reg, lhs reg, rhs reg |
 | 0x26 | `ige` | ty:IntTy | dst reg, lhs reg, rhs reg |
+| 0x27 | `ipow` | op:IntOp | dst reg, lhs reg, rhs reg |
 | 0x30 | `fadd` | ty:FloatTy | dst reg, lhs reg, rhs reg |
 | 0x31 | `fsub` | ty:FloatTy | dst reg, lhs reg, rhs reg |
 | 0x32 | `fmul` | ty:FloatTy | dst reg, lhs reg, rhs reg |
@@ -1120,6 +1397,7 @@ checks that this table lists every opcode.
 | 0x45 | `fgt` | ty:FloatTy | dst reg, lhs reg, rhs reg |
 | 0x46 | `fge` | ty:FloatTy | dst reg, lhs reg, rhs reg |
 | 0x47 | `ftotal_cmp` | ty:FloatTy | dst reg, lhs reg, rhs reg |
+| 0x48 | `fpow` | ty:FloatTy | dst reg, lhs reg, rhs reg |
 | 0x50 | `bnot` | — | dst reg, src reg |
 | 0x51 | `band` | — | dst reg, lhs reg, rhs reg |
 | 0x52 | `bor` | — | dst reg, lhs reg, rhs reg |
@@ -1137,8 +1415,8 @@ checks that this table lists every opcode.
 | 0x63 | `trunc` | pair:IntPair | dst reg, src reg |
 | 0x64 | `int_to_f32` | ty:IntTy | dst reg, src reg |
 | 0x65 | `int_to_f64` | ty:IntTy | dst reg, src reg |
-| 0x66 | `f32_to_int` | op:IntOp | dst reg, src reg |
-| 0x67 | `f64_to_int` | op:IntOp | dst reg, src reg |
+| 0x66 | `f32_to_int` | conv:FloatConv | dst reg, src reg |
+| 0x67 | `f64_to_int` | conv:FloatConv | dst reg, src reg |
 | 0x68 | `f32_to_f64` | — | dst reg, src reg |
 | 0x69 | `f64_to_f32` | — | dst reg, src reg |
 | 0x6A | `float_to_bits` | ty:IntTy | dst reg, src reg |
@@ -1159,7 +1437,7 @@ checks that this table lists every opcode.
 | 0x7A | `dshl` | pol:Policy | dst reg, lhs reg, rhs reg |
 | 0x7B | `dshr` | pol:Policy | dst reg, lhs reg, rhs reg |
 | 0x7C | `dneg` | pol:Policy | dst reg, src reg |
-| 0x7D | `dnot` | pol:Policy | dst reg, src reg |
+| 0x7D | `dbit_not` | pol:Policy | dst reg, src reg |
 | 0x7E | `deq` | — | dst reg, lhs reg, rhs reg |
 | 0x7F | `dne` | — | dst reg, lhs reg, rhs reg |
 | 0x80 | `dlt` | — | dst reg, lhs reg, rhs reg |
@@ -1182,7 +1460,15 @@ checks that this table lists every opcode.
 | 0x91 | `dcall` | — | dst reg, callee reg, argc u8 |
 | 0x92 | `diter_new` | — | dst reg, src reg |
 | 0x93 | `dlen` | — | dst reg, src reg |
-| 0x94 | `dlnot` | — | dst reg, src reg |
+| 0x94 | `dnot` | — | dst reg, src reg |
+| 0x95 | `dpow` | pol:Policy | dst reg, lhs reg, rhs reg |
+| 0x96 | `dabs` | pol:Policy | dst reg, src reg |
+| 0x97 | `dsep_index` | — | dst reg, obj reg, key reg |
+| 0x98 | `dsep_prop` | — | dst reg, obj reg, name name |
+| 0x99 | `dcall_shape` | — | dst reg, callee reg, shape shape |
+| 0x9A | `dparam_ref` | — | dst reg, callee reg, pos reg |
+| 0x9B | `dparam_ref_named` | — | dst reg, callee reg, name name |
+| 0x9C | `err_payload` | — | dst reg, src reg |
 | 0xA0 | `jmp` | — | target target |
 | 0xA1 | `jmp_if` | — | cond reg, target target |
 | 0xA2 | `jmp_if_not` | — | cond reg, target target |
@@ -1198,11 +1484,19 @@ checks that this table lists every opcode.
 | 0xAC | `err_code` | — | dst reg, src reg |
 | 0xAD | `safepoint` | — | — |
 | 0xAE | `unreachable` | — | — |
+| 0xAF | `raise` | kind:ErrorKind | src reg |
 | 0xB0 | `make_closure` | — | dst reg, func func |
 | 0xB1 | `get_upval` | — | dst reg, idx upval |
 | 0xB2 | `new_cell` | — | dst reg, src reg, ty type |
 | 0xB3 | `cell_get` | — | dst reg, cell reg |
 | 0xB4 | `cell_set` | — | cell reg, src reg |
+| 0xB5 | `new_ref` | — | dst reg, src reg |
+| 0xB6 | `dref_index` | — | dst reg, obj reg, key reg |
+| 0xB7 | `dref_prop` | — | dst reg, obj reg, name name |
+| 0xB8 | `dbind_index` | — | obj reg, key reg, src reg |
+| 0xB9 | `dbind_prop` | — | obj reg, name name, src reg |
+| 0xBA | `dunref_index` | — | obj reg, key reg |
+| 0xBB | `dunref_prop` | — | obj reg, name name |
 | 0xC0 | `new_struct` | — | dst reg, ty type |
 | 0xC1 | `get_field` | — | dst reg, obj reg, field field |
 | 0xC2 | `set_field` | — | obj reg, field field, src reg |

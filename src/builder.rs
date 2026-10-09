@@ -23,10 +23,11 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::fmt;
 
+use crate::call::{ArgKind, CallShape, ParamError, ParamList, ShapeError};
 use crate::encode::section_sizes;
 use crate::ids::{
-    ConstId, FuncId, GlobalId, ImportId, NameRef, Reg, StrId, TableId, Target, TypeId, TypeRef,
-    UpvalIdx,
+    ConstId, FuncId, GlobalId, ImportId, NameRef, Reg, ShapeId, StrId, TableId, Target, TypeId,
+    TypeRef, UpvalIdx,
 };
 use crate::inst::Inst;
 use crate::module::{
@@ -118,6 +119,21 @@ pub enum BuildError {
         /// The register written twice.
         dst: Reg,
     },
+    /// A function's or an import's [`ParamList`] breaks a rule of its own
+    /// or does not fit its signature.
+    InvalidParams {
+        /// The function or import.
+        owner: Callee,
+        /// What is wrong.
+        error: ParamError,
+    },
+    /// A [`CallShape`] is malformed.
+    InvalidShape {
+        /// The function.
+        func: FuncId,
+        /// What is wrong.
+        error: ShapeError,
+    },
     /// A function builder does not belong to this module builder, or was
     /// already added.
     ForeignFunction(FuncId),
@@ -169,6 +185,12 @@ impl fmt::Display for BuildError {
             ),
             BuildError::ConflictingMoves { func, dst } => {
                 write!(f, "a parallel move in {func} writes {dst} twice")
+            }
+            BuildError::InvalidParams { owner, error } => {
+                write!(f, "the parameter list of {owner} is invalid: {error}")
+            }
+            BuildError::InvalidShape { func, error } => {
+                write!(f, "a call shape of {func} is invalid: {error}")
             }
             BuildError::ForeignFunction(func) => {
                 write!(
@@ -268,6 +290,9 @@ pub struct FunctionBuilder {
     name_index: BTreeMap<StrId, NameRef>,
     type_refs: Vec<TypeId>,
     type_index: BTreeMap<TypeId, TypeRef>,
+    param_list: Option<ParamList>,
+    shapes: Vec<CallShape>,
+    shape_index: BTreeMap<CallShape, ShapeId>,
     code: Vec<Inst>,
     labels: Vec<Option<u32>>,
     /// Branches emitted against a label: (pc, label).
@@ -298,6 +323,9 @@ impl FunctionBuilder {
             name_index: BTreeMap::new(),
             type_refs: Vec::new(),
             type_index: BTreeMap::new(),
+            param_list: None,
+            shapes: Vec::new(),
+            shape_index: BTreeMap::new(),
             code: Vec::new(),
             labels: Vec::new(),
             fixups: Vec::new(),
@@ -522,6 +550,102 @@ impl FunctionBuilder {
                 TypeRef(u16::MAX)
             }
         }
+    }
+
+    /// Gives the function a dynamic-call signature: parameter names, kinds,
+    /// by-reference flags, and defaults, which `dcall`/`dcall_shape` bind
+    /// arguments to (`specs/LSB.md` §5.15). The list is checked when the
+    /// function is added: its own rules ([`ParamList::validate`]) and that it
+    /// fits the signature ([`ParamList::fits`]: one parameter per entry, and
+    /// a trailing `i64` presence mask when an entry has a default).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytecode_lang::{ModuleBuilder, Param, ParamKind, ParamList, ValType};
+    ///
+    /// // PHP: function f($x, ...$rest) — every function value of a dynamic
+    /// // language takes its arguments this way.
+    /// let mut m = ModuleBuilder::new();
+    /// let x = m.string("x");
+    /// let mut f = m.function("f", &[ValType::Dyn, ValType::Dyn], &[]);
+    /// f.set_params(ParamList::new(vec![Param::normal(x), Param::new(ParamKind::RestMap, None)]));
+    /// f.ret_void();
+    /// assert!(m.add_function(f).is_ok());
+    /// ```
+    pub fn set_params(&mut self, list: ParamList) {
+        self.param_list = Some(list);
+    }
+
+    /// The function-local [`ShapeId`] for the call shape `args`, adding it
+    /// to the function's shape table on first use. A malformed shape (see
+    /// [`CallShape::validate`]) is recorded and reported when the function
+    /// is added.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytecode_lang::{ArgKind, ModuleBuilder, ShapeId};
+    ///
+    /// let mut m = ModuleBuilder::new();
+    /// let flag = m.string("flag");
+    /// let mut f = m.function("f", &[], &[]);
+    /// let s = f.call_shape(&[ArgKind::Spread, ArgKind::Named(flag)]);
+    /// assert_eq!(s, ShapeId(0));
+    /// assert_eq!(f.call_shape(&[ArgKind::Spread, ArgKind::Named(flag)]), s);
+    /// ```
+    pub fn call_shape(&mut self, args: &[ArgKind]) -> ShapeId {
+        let shape = CallShape::new(args.to_vec());
+        if let Some(&id) = self.shape_index.get(&shape) {
+            return id;
+        }
+        if let Err(error) = shape.validate() {
+            self.fail(BuildError::InvalidShape {
+                func: self.id,
+                error,
+            });
+            return ShapeId(u16::MAX);
+        }
+        match u16::try_from(self.shapes.len()) {
+            Ok(index) => {
+                let id = ShapeId(index);
+                let _previous = self.shape_index.insert(shape.clone(), id);
+                self.shapes.push(shape);
+                id
+            }
+            Err(_) => {
+                self.too_many("call shapes");
+                ShapeId(u16::MAX)
+            }
+        }
+    }
+
+    /// Emits `dcall_shape dst, callee, csN` with the shape `args` (interned
+    /// by [`call_shape`](Self::call_shape)): a dynamic call whose window
+    /// `dst+1 ..= dst+args.len()` holds positional, named, and spread
+    /// arguments.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytecode_lang::{ArgKind, Inst, ModuleBuilder, ShapeId, ValType};
+    ///
+    /// let mut m = ModuleBuilder::new();
+    /// let x = m.string("x");
+    /// let mut f = m.function("f", &[ValType::Dyn], &[]);
+    /// let window = f.regs(&[ValType::Dyn, ValType::Dyn]);
+    /// f.dcall_shape(window, f.param(0), &[ArgKind::Named(x)]);
+    /// f.ret_void();
+    /// let id = m.add_function(f).unwrap();
+    /// let module = m.finish().unwrap();
+    /// assert_eq!(
+    ///     module.function(id).unwrap().code()[0],
+    ///     Inst::DCallShape { dst: window, callee: bytecode_lang::Reg(0), shape: ShapeId(0) },
+    /// );
+    /// ```
+    pub fn dcall_shape(&mut self, dst: Reg, callee: Reg, args: &[ArgKind]) -> u32 {
+        let shape = self.call_shape(args);
+        self.emit(Inst::DCallShape { dst, callee, shape })
     }
 
     /// Sets the source position of the instructions emitted from now on.
@@ -1058,6 +1182,15 @@ impl FunctionBuilder {
             return Err(error);
         }
         let func = self.id;
+        if let Some(list) = &self.param_list {
+            let sig_params = self.regs.get(..usize::from(self.params)).unwrap_or(&[]);
+            if let Err(error) = list.validate().and_then(|()| list.fits(sig_params)) {
+                return Err(BuildError::InvalidParams {
+                    owner: Callee::Func(func),
+                    error,
+                });
+            }
+        }
         let len = self.pc();
         let labels = core::mem::take(&mut self.labels);
         let resolve =
@@ -1156,11 +1289,13 @@ impl FunctionBuilder {
             Function {
                 name: self.name,
                 sig: self.sig,
+                params: self.param_list,
                 regs: self.regs,
                 captures: self.captures,
                 names: self.names,
                 type_refs: self.type_refs,
                 tables,
+                shapes: self.shapes,
                 handlers,
                 code: self.code,
                 lines: self.lines,
@@ -1423,8 +1558,60 @@ impl ModuleBuilder {
             self.fail(BuildError::ModuleFull("import"));
             return ImportId(u32::MAX);
         };
-        self.imports.push(Import { module, name, sig });
+        self.imports.push(Import {
+            module,
+            name,
+            sig,
+            params: None,
+        });
         ImportId(id)
+    }
+
+    /// Adds a host-function import with a dynamic-call signature, so it can
+    /// be a first-class value taking named, spread, extra, missing, and
+    /// by-reference arguments through `dcall`/`dcall_shape` (PHP's
+    /// `printf(...$args)`, `array_push(&$a, ...$v)`). `sig` must already be
+    /// a function type of this builder; the list is checked against it as
+    /// [`FunctionBuilder::set_params`] checks a function's.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytecode_lang::{ModuleBuilder, Param, ParamKind, ParamList, ValType};
+    ///
+    /// // printf(string $format, mixed ...$values): int
+    /// let mut m = ModuleBuilder::new();
+    /// let format = m.string("format");
+    /// let sig = m.func_type(&[ValType::Dyn, ValType::Dyn], &[ValType::Dyn]);
+    /// let list = ParamList::new(vec![Param::normal(format), Param::new(ParamKind::RestMap, None)]);
+    /// let printf = m.import_with_params("php.std", "printf", sig, list);
+    /// let module = m.finish().unwrap();
+    /// assert!(module.import(printf).unwrap().params.is_some());
+    /// ```
+    pub fn import_with_params(
+        &mut self,
+        module: &str,
+        name: &str,
+        sig: TypeId,
+        params: ParamList,
+    ) -> ImportId {
+        let id = self.import(module, name, sig);
+        let checked = match self.types.get(sig.index()) {
+            Some(Some(TypeDef::Func(ft))) => {
+                params.validate().and_then(|()| params.fits(&ft.params))
+            }
+            _ => Err(ParamError::Signature { index: 0 }),
+        };
+        if let Err(error) = checked {
+            self.fail(BuildError::InvalidParams {
+                owner: Callee::Import(id),
+                error,
+            });
+        }
+        if let Some(import) = self.imports.get_mut(id.index()) {
+            import.params = Some(params);
+        }
+        id
     }
 
     /// Adds a global.

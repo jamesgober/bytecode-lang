@@ -691,7 +691,7 @@ fn coroutine_instructions_build_and_round_trip() {
         callee: value,
         argc: 1,
     });
-    f.emit(Inst::DLNot {
+    f.emit(Inst::DNot {
         dst: flag,
         src: value,
     });
@@ -730,7 +730,7 @@ fn coroutine_instructions_build_and_round_trip() {
         "await r3, r3",
         "coro_new_indirect r6, r3, 0",
         "spawn r7, r3, 1",
-        "dlnot r5, r3",
+        "dnot r5, r3",
         "yield_kv r3, r6, r3",
         "coro_close r3, r1, r3",
         "coro_key r6, r1",
@@ -741,4 +741,223 @@ fn coroutine_instructions_build_and_round_trip() {
         assert!(text.contains(line), "missing `{line}` in\n{text}");
     }
     assert_eq!(CoroState::from_code(2), Some(CoroState::Yielded));
+}
+
+#[test]
+fn parameter_lists_are_checked_against_their_rules_and_signature() {
+    use bytecode_lang::{Param, ParamError, ParamKind, ParamList};
+    let d = ValType::Dyn;
+    let build = |params: &[ValType], list: ParamList| {
+        let mut m = ModuleBuilder::new();
+        let mut f = m.function("f", params, &[]);
+        f.set_params(list);
+        f.ret_void();
+        m.add_function(f)
+    };
+    let invalid = |error| {
+        Err(BuildError::InvalidParams {
+            owner: Callee::Func(FuncId(0)),
+            error,
+        })
+    };
+    // Rules of the list itself.
+    let unnamed = ParamList::new(vec![Param::new(ParamKind::NamedOnly, None)]);
+    assert_eq!(
+        build(&[d], unnamed),
+        invalid(ParamError::Unnamed { index: 0 })
+    );
+    let backwards = ParamList::new(vec![
+        Param::new(ParamKind::RestNamed, None),
+        Param::new(ParamKind::Rest, None),
+    ]);
+    assert_eq!(
+        build(&[d, d], backwards),
+        invalid(ParamError::OutOfOrder { index: 1 })
+    );
+    // Fit to the signature: count, presence mask, rest and by-ref types.
+    let x = StrId(0);
+    let one = ParamList::new(vec![Param::normal(x)]);
+    assert_eq!(
+        build(&[d, d], one.clone()),
+        invalid(ParamError::Signature { index: 1 })
+    );
+    assert!(build(&[ValType::I32], one).is_ok()); // by value: any type converts
+    let optional = ParamList::new(vec![Param::normal(x).with_default()]);
+    assert_eq!(
+        build(&[d], optional.clone()),
+        invalid(ParamError::Signature { index: 1 })
+    );
+    assert!(build(&[d, ValType::I64], optional).is_ok());
+    let rest = ParamList::new(vec![Param::new(ParamKind::Rest, None)]);
+    assert_eq!(
+        build(&[ValType::Str], rest),
+        invalid(ParamError::Signature { index: 0 })
+    );
+    let by_ref = ParamList::new(vec![Param::normal(x).by_ref()]);
+    assert_eq!(
+        build(&[ValType::I64], by_ref.clone()),
+        invalid(ParamError::Signature { index: 0 })
+    );
+    assert!(build(&[ValType::Ref(TypeId(0))], by_ref).is_ok());
+    // A function without a list keeps exact positional arity.
+    let mut m = ModuleBuilder::new();
+    let mut f = m.function("plain", &[d], &[]);
+    f.ret_void();
+    let id = m.add_function(f).unwrap();
+    assert!(m.finish().unwrap().function(id).unwrap().params().is_none());
+}
+
+#[test]
+fn imports_take_parameter_lists_checked_against_their_signature() {
+    use bytecode_lang::{Param, ParamError, ParamKind, ParamList};
+    let mut m = ModuleBuilder::new();
+    let format = m.string("format");
+    let sig = m.func_type(&[ValType::Dyn, ValType::Dyn], &[ValType::Dyn]);
+    let list = ParamList::new(vec![
+        Param::normal(format),
+        Param::new(ParamKind::RestMap, None),
+    ]);
+    let printf = m.import_with_params("php", "printf", sig, list.clone());
+    let module = m.finish().unwrap();
+    assert_eq!(module.import(printf).unwrap().params, Some(list.clone()));
+    let bytes = bytecode_lang::encode(&module);
+    assert_eq!(bytecode_lang::decode(&bytes).unwrap(), module);
+
+    // Too few signature parameters for the list.
+    let mut m = ModuleBuilder::new();
+    let short = m.func_type(&[ValType::Dyn], &[]);
+    let id = m.import_with_params("php", "printf", short, list.clone());
+    assert_eq!(
+        m.finish().unwrap_err(),
+        BuildError::InvalidParams {
+            owner: Callee::Import(id),
+            error: ParamError::Signature { index: 1 }
+        }
+    );
+    // A signature that is not a function type.
+    let mut m = ModuleBuilder::new();
+    let cell = m.add_type(TypeDef::Cell(ValType::Dyn));
+    let id = m.import_with_params("php", "printf", cell, list);
+    assert_eq!(
+        m.finish().unwrap_err(),
+        BuildError::InvalidParams {
+            owner: Callee::Import(id),
+            error: ParamError::Signature { index: 0 }
+        }
+    );
+}
+
+#[test]
+fn call_shapes_are_deduplicated_checked_and_bounded() {
+    use bytecode_lang::{ArgKind, ShapeError, ShapeId};
+    let mut m = ModuleBuilder::new();
+    let (x, y) = (m.string("x"), m.string("y"));
+    let mut f = m.function("f", &[ValType::Dyn], &[]);
+    let a = f.call_shape(&[ArgKind::Positional, ArgKind::Named(x)]);
+    let b = f.call_shape(&[ArgKind::Spread]);
+    assert_eq!((a, b), (ShapeId(0), ShapeId(1)));
+    assert_eq!(f.call_shape(&[ArgKind::Positional, ArgKind::Named(x)]), a);
+    let window = f.regs(&[ValType::Dyn, ValType::Dyn, ValType::Dyn]);
+    let pc = f.dcall_shape(
+        window,
+        f.param(0),
+        &[ArgKind::Named(y), ArgKind::SpreadNamed],
+    );
+    assert_eq!(pc, 0);
+    f.ret_void();
+    let id = m.add_function(f).unwrap();
+    let module = m.finish().unwrap();
+    let func = module.function(id).unwrap();
+    assert_eq!(func.shapes().len(), 3);
+    assert_eq!(
+        func.code()[0],
+        Inst::DCallShape {
+            dst: window,
+            callee: Reg(0),
+            shape: ShapeId(2)
+        }
+    );
+
+    // A malformed shape is reported when the function is added.
+    let mut m = ModuleBuilder::new();
+    let mut f = m.function("f", &[], &[]);
+    let _bad = f.call_shape(&[ArgKind::SpreadNamed, ArgKind::Positional]);
+    f.ret_void();
+    assert_eq!(
+        m.add_function(f),
+        Err(BuildError::InvalidShape {
+            func: FuncId(0),
+            error: ShapeError::PositionalAfterNamed { index: 1 }
+        })
+    );
+
+    // 65,536 shapes fit a 16-bit id; the next one does not.
+    let mut m = ModuleBuilder::new();
+    let names: Vec<StrId> = (0..=65_536u32).map(|i| m.string(&i.to_string())).collect();
+    let mut f = m.function("f", &[], &[]);
+    for &name in &names {
+        let _ = f.call_shape(&[ArgKind::Named(name)]);
+    }
+    f.ret_void();
+    assert_eq!(
+        m.add_function(f),
+        Err(BuildError::TooMany {
+            func: FuncId(0),
+            what: "call shapes"
+        })
+    );
+}
+
+#[test]
+fn new_build_errors_describe_the_problem() {
+    use bytecode_lang::{ParamError, ShapeError};
+    assert_eq!(
+        BuildError::InvalidParams {
+            owner: Callee::Func(FuncId(3)),
+            error: ParamError::Unnamed { index: 1 }
+        }
+        .to_string(),
+        "the parameter list of f3 is invalid: parameter 1 can be named but has no name"
+    );
+    assert_eq!(
+        BuildError::InvalidShape {
+            func: FuncId(0),
+            error: ShapeError::DuplicateName { index: 2 }
+        }
+        .to_string(),
+        "a call shape of f0 is invalid: argument 2 repeats an earlier name"
+    );
+}
+
+#[test]
+fn promote_on_the_new_dynamic_arithmetic_needs_a_dyn_destination() {
+    use bytecode_lang::{Overflow, Policy};
+    let promote = Policy::new().with_overflow(Overflow::Promote);
+    let mut m = ModuleBuilder::new();
+    let mut f = m.function("f", &[ValType::Dyn], &[]);
+    let typed = f.reg(ValType::I64);
+    f.emit(Inst::DAbs {
+        dst: typed,
+        src: f.param(0),
+        pol: promote,
+    });
+    f.ret_void();
+    assert_eq!(
+        m.add_function(f),
+        Err(BuildError::PromoteNotDynamic {
+            func: FuncId(0),
+            pc: 0
+        })
+    );
+    let mut m = ModuleBuilder::new();
+    let mut f = m.function("f", &[ValType::Dyn], &[ValType::Dyn]);
+    let out = f.reg(ValType::Dyn);
+    f.emit(Inst::DPow {
+        dst: out,
+        lhs: f.param(0),
+        rhs: f.param(0),
+        pol: promote,
+    });
+    f.ret(out);
+    assert!(m.add_function(f).is_ok());
 }

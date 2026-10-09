@@ -259,6 +259,14 @@ code_enum! {
         /// A coroutine: a suspendable stack of frames (generators, async
         /// tasks; see [`Inst::CoroNew`](crate::Inst::CoroNew)).
         Coroutine = 13 => "coroutine",
+        /// A reference (PHP `&`): a box holding one dynamic value, made by
+        /// [`Inst::NewRef`](crate::Inst::NewRef) or by taking a reference to
+        /// a container slot ([`Inst::DRefIndex`](crate::Inst::DRefIndex),
+        /// [`Inst::DRefProp`](crate::Inst::DRefProp)). It is a cell of `dyn`
+        /// (`cell_get`/`cell_set` read and write it), and a container slot
+        /// holding one is *transparent*: reads and writes of the slot go
+        /// through to the reference's value (`specs/LSB.md` §5.16).
+        Reference = 14 => "reference",
     }
 }
 

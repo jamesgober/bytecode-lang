@@ -180,6 +180,23 @@ index_type! {
 }
 
 index_type! {
+    /// An index into the running function's call shapes (see
+    /// [`Inst::DCallShape`](crate::Inst::DCallShape) and
+    /// [`CallShape`](crate::CallShape)): which window arguments are positional,
+    /// named, or spread. 16-bit, like [`NameRef`], so a function may use 65,536
+    /// distinct shapes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytecode_lang::ShapeId;
+    ///
+    /// assert_eq!(ShapeId(2).to_string(), "cs2");
+    /// ```
+    ShapeId(u16) => "cs"
+}
+
+index_type! {
     /// A field slot of a struct type, counted across the whole parent chain
     /// (a struct's fields start with its parent's).
     ///
