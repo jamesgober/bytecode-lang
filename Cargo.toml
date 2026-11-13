@@ -16,10 +16,10 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Description
-description = "LSB, the LexerSketch bytecode format: instruction set, verifier, disassembler, and versioned encoding."
+description = "LSB, the toolchain's bytecode format: instruction set, verifier, disassembler, and versioned encoding."
 
 # Keywords (5 max)
-keywords = ["bytecode", "vm", "verifier", "compiler", "lexersketch"]
+keywords = ["bytecode", "vm", "verifier", "compiler"]
 
 # Categories
 categories = ["compilers", "encoding", "no-std"]

@@ -3,7 +3,7 @@
     <br>
     <b>bytecode-lang</b>
     <br>
-    <sub><sup>LEXERSKETCH BYTECODE FORMAT</sup></sub>
+    <sub><sup>BYTECODE FORMAT</sup></sub>
 </h1>
 
 <div align="center">
@@ -18,7 +18,7 @@
 
 <div align="left">
     <p>
-        <strong>bytecode-lang</strong> defines LSB, the one bytecode format of the LexerSketch toolchain: a register-machine instruction set for static and dynamic languages alike, the module that holds it, a versioned binary encoding, a decoder that treats every byte as hostile, a deterministic disassembler, and a builder that resolves branch labels. Code generators emit LSB, the VM executes it, program images store it, and the debugger reads its line tables.
+        <strong>bytecode-lang</strong> defines LSB, the one bytecode format of the toolchain: a register-machine instruction set for static and dynamic languages alike, the module that holds it, a versioned binary encoding, a decoder that treats every byte as hostile, a deterministic disassembler, and a builder that resolves branch labels. Code generators emit LSB, the VM executes it, program images store it, and the debugger reads its line tables.
     </p>
     <p>
         Instructions are eight bytes, encoded and decoded alike, so a function body is a flat array the interpreter walks without parsing. Registers are typed, with <code>dyn</code> as one of the types, so the same format carries an unboxed <code>i64</code> loop for a systems language and PHP-style arrays, properties, and loose comparisons for a dynamic one. Every integer instruction carries its overflow, division, and shift policy, so every execution tier computes the same result or raises the same error.
@@ -47,7 +47,7 @@
 - **[`encode`](./docs/API.md#encode)** and **[`decode`](./docs/API.md#decode)** convert between a module and its canonical bytes; **[`disassemble`](./docs/API.md#disassemble)** prints it.
 - **[`ModuleBuilder`](./docs/API.md#modulebuilder)** builds modules: branches take labels, strings and constants are deduplicated, and simultaneous register moves are sequentialized correctly.
 
-The normative semantics of every instruction, the encoding, and the verifier's rules are in the LexerSketch spec `specs/LSB.md`.
+The normative semantics of every instruction, the encoding, and the verifier's rules are in the toolchain's spec `specs/LSB.md`.
 
 <br>
 
