@@ -1,8 +1,7 @@
 # bytecode-lang - Roadmap
 
 > Path from scaffold to a stable 1.0. Hard parts are front-loaded; each phase has hard exit criteria.
-> Master plan: ../_lexersketch/ROADMAP.md and ../_lexersketch/NEW-LIBS.md
-> Normative spec: ../_lexersketch/specs/LSB.md (format version 2 since v0.3.0).
+> Normative spec: the LSB specification (format version 2 since v0.3.0).
 >
 > **Anti-deferral rule:** no listed hard task moves to a later phase unless this file records the move and the reason.
 
@@ -65,7 +64,7 @@ Known gaps carried into v0.5.0 (by design of the phase split, not deferrals):
 
 ## v0.3.0 - Format version 2: PHP semantics the VM cannot fake (DONE, prepared 2026-10-09)
 Inserted before the verifier because bcgen-lang 0.2 and bvm-lang 2.0.0-alpha.2 found format gaps
-that block Mox (LexerSketch ISSUES P23, P26, P27 rule 10, P28) and that the verifier must already
+that block Mox (issues P23, P26, P27 rule 10, P28) and that the verifier must already
 know about; a breaking 0.x minor.
 
 Delivered:

@@ -24,7 +24,7 @@
 ## [0.3.0] - 2026-10-09
 
 LSB **format version 2**: the format gaps bcgen-lang 0.2 and bvm-lang 2.0.0-alpha.2 found
-(LexerSketch ISSUES P23, P26, P27 rule 10, P28). A breaking 0.x minor: format 1 files are refused,
+(issues P23, P26, P27 rule 10, P28). A breaking 0.x minor: format 1 files are refused,
 and the API changes listed under **Breaking** need code changes in every consumer. The spec,
 `specs/LSB.md`, is revised in the same change (format version 2, §5.15–5.17 new), with a note on
 dynamic NaN added to `specs/OPS.md` §4.
@@ -111,7 +111,7 @@ dynamic NaN added to `specs/OPS.md` §4.
 
 The foundation: LSB's instruction set, module model, versioned encoding, budgeted decoder,
 disassembler, and a builder that resolves branch labels. The normative specification is the
-LexerSketch spec `specs/LSB.md`, written alongside this release. The verifier is 0.5.0.
+toolchain spec `specs/LSB.md`, written alongside this release. The verifier is 0.5.0.
 
 ### Added
 

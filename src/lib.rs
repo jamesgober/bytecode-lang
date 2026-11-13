@@ -1,6 +1,6 @@
 //! # bytecode_lang
 //!
-//! LSB, the LexerSketch bytecode format: one register-machine instruction
+//! LSB, the toolchain's bytecode format: one register-machine instruction
 //! set for every language and every execution tier, its module model, a
 //! versioned binary encoding, a budgeted decoder, a deterministic
 //! disassembler, and a builder that resolves branch labels.
@@ -66,7 +66,7 @@
 //!   [`CoroState`].
 //!
 //! The normative description of every instruction is `specs/LSB.md` in the
-//! LexerSketch plan; `docs/API.md` documents every public item.
+//! toolchain plan; `docs/API.md` documents every public item.
 //!
 //! ## Guarantees
 //!

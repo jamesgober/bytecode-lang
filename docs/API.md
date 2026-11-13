@@ -3,8 +3,8 @@
 > Complete reference for every public item in `bytecode-lang` 0.3.0 (LSB format version 2), with
 > examples.
 > **Status: pre-1.0.** The surface is designed across the 0.x series and frozen at `1.0`, after a
-> VM runs Mox programs from it (LexerSketch decision D18). The normative format and instruction
-> semantics are in the LexerSketch spec `specs/LSB.md`; this file documents the Rust API.
+> VM runs Mox programs from it (decision D18). The normative format and instruction
+> semantics are in the toolchain's spec `specs/LSB.md`; this file documents the Rust API.
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -47,7 +47,7 @@
 
 ## Overview
 
-`bytecode-lang` defines LSB, the single bytecode format of the LexerSketch toolchain. A
+`bytecode-lang` defines LSB, the single bytecode format of the toolchain. A
 [`Module`](#module) holds tables (strings, types, constants, imports, globals, exports, hooks) and
 functions; a function is a typed register frame plus a flat array of eight-byte
 [`Inst`](#inst)ructions. [`encode`](#encode) turns a module into canonical bytes,
